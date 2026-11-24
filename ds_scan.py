@@ -19,6 +19,9 @@
 #    9  the worker: check-in, heartbeat, claiming, the queue, renewals, hand-ins, stopping
 #   10  the endpoints and serve()
 #
+#__version__ = '2026.48.3'    # against db 2026-48-02 as built (note 2026-48-17): the {held, known} lookup, became_skipped_parts,
+#                              10,000 objects and 50,000 parts a call, part and meta limits; folders checked again until usable
+#                              (note 2026-48-22); the shared health sentences (note 2026-48-23); deploy/ds_scan_worker.example.yml
 #__version__ = '2026.48.2'    # the start-up report (architect note 2026-48-20): what the container was given, before the
 #                              settings are checked; settings_invalid names the path it looked at
 #__version__ = '2026.48.1'    # first V2 build: directory and postgres through ds_connect_lib; txt, csv, json, xml, html,
@@ -57,7 +60,7 @@ import ds_connect_lib
 # ===========================================================================
 # 1. VERSIONS, SETTINGS, LOGGING, CATALOGUES
 # ===========================================================================
-VERSION = "2026.48.2"
+VERSION = "2026.48.3"
 WORKER_TYPE = "scan"
 STAGE = "scan"
 STANDARD = "worker-core-standard 2026-48-11"
@@ -69,14 +72,17 @@ SCAN_SOURCE_TYPES = ("directory", "postgres")
 # timers (seconds). The standard's numbers; the tests shorten them by setting these attributes
 HEARTBEAT_SEC = 30.0
 RENEW_SEC = 30.0
-BATCH_OBJECTS = 10000              # a hand-in at 10,000 objects (parts count too) or ...
+BATCH_OBJECTS = 10000              # a hand-in at 10,000 objects (or 50,000 parts) or ...
 BATCH_SEC = 300.0                  # ... every five minutes, whichever comes first
 STOP_LIMIT_SEC = 10.0              # scan's stop limit (architect note 2026-48-10 §3)
 SIGTERM_LIMIT_SEC = 30.0           # the standard's SIGTERM allowance
 RECONNECT_MAX_SEC = 30.0
 CONTRACT_RECHECK_SEC = 60.0
 PAGE_LIMIT = 500                   # objects read from the queue per call
-PARTS_PER_CALL = 20000             # an object's parts beyond this go over several calls (parts_final)
+PARTS_PER_CALL = 50000             # parts in all in one call (db 2026-48-02); an object's parts beyond go over several calls (parts_final)
+INNER_PATH_MAX = 1000              # a part's inner_path, characters (db 2026-48-02)
+PART_NAME_MAX = 400                # a part's name, characters (db 2026-48-02)
+META_DB_TYPES_MAX = 8000           # bytes of a table's meta.db_types before the list is cut
 TABLE_PART_ROWS = 50000            # rows per working-file part
 TEXT_PART_CHARS = 64 * 1024 * 1024 # a text part is also cut at this many characters
 TABLE_FETCH_ROWS = 5000            # rows per fetch on a server-side cursor
@@ -593,18 +599,22 @@ REASONS = collections.OrderedDict([
 
 # health codes (standard §7): one code for one sentence; problems and work alike
 HEALTH = collections.OrderedDict([
-    ("starting", "Starting up"),
-    ("idle", "Waiting for a queue to take"),
-    ("reconnecting", "Reconnecting to the database"),
-    ("stopping", "Stopping"),
+    # the five every worker has, word for word as every worker sends them (architect note 2026-48-23)
+    ("idle", "Idle"),
+    ("starting", "The worker is still starting"),
+    ("reconnecting", "The worker is reconnecting to the database"),
+    ("stopping", "The worker is stopping"),
+    ("contract_missing", "The database is missing functions this worker needs"),
+    # a queue worker's work codes, as the standard has them (§7)
     ("working", "Working on the {stage} stage of run {run_id}"),
     ("waiting_for_work", "Waiting for objects on run {run_id}"),
     ("winding_down", "Finishing up on run {run_id}"),
+    # scan's own
     ("waiting_for_space", "Waiting for free space in the working folder on run {run_id}"),
-    ("contract_missing", "The database lacks functions this worker calls"),
-    ("work_dir_unusable", "The working folder or the temporary folder can't be written"),
+    ("work_dir_unusable", "The worker can't use the folder set by {setting}: the {step} step failed"),
     ("queue_set_aside", "A queue was set aside after the database refused it three times"),
 ])
+HEALTH_STANDARD = ("idle", "starting", "reconnecting", "stopping", "contract_missing", "working", "waiting_for_work", "winding_down")
 
 
 def _sentence(text):
@@ -789,13 +799,19 @@ def json_safe(obj, depth=0):
     return pg_safe_str(str(obj))
 
 
-META_MAX = 16384
+META_MAX = 16384           # the database's limit, in bytes of the JSON text (db 2026-48-02)
+META_TARGET = 15360        # what scan keeps meta under: the database's text and Python's can differ by a little
+
+
+def _meta_bytes(meta):
+    return len(json.dumps(meta, ensure_ascii=False).encode("utf-8"))
 
 
 def cap_meta(meta):
-    """meta held to 16 KB (directive 2026-48-09 §2): long strings cut, then long lists cut, then keys dropped."""
+    """meta held under 16 KB: long strings cut, then long lists cut, then the largest keys dropped; whenever
+    anything was cut, meta_cut is true."""
     meta = json_safe(meta or {})
-    if len(json.dumps(meta, ensure_ascii=False).encode("utf-8")) <= META_MAX:
+    if _meta_bytes(meta) <= META_TARGET:
         return meta
 
     def cut(v, n):
@@ -809,12 +825,13 @@ def cap_meta(meta):
 
     for n in (1000, 200, 60):
         meta = cut(meta, n)
-        if len(json.dumps(meta, ensure_ascii=False).encode("utf-8")) <= META_MAX:
+        meta["meta_cut"] = True
+        if _meta_bytes(meta) <= META_TARGET:
             return meta
-    keys = sorted(meta, key=lambda k: len(json.dumps(meta[k], ensure_ascii=False)), reverse=True)
+    keys = sorted((k for k in meta if k != "meta_cut"), key=lambda k: len(json.dumps(meta[k], ensure_ascii=False)), reverse=True)
     for k in keys:
         meta.pop(k, None)
-        if len(json.dumps(meta, ensure_ascii=False).encode("utf-8")) <= META_MAX - 40:
+        if _meta_bytes(meta) <= META_TARGET:
             break
     meta["meta_cut"] = True
     return meta
@@ -1672,7 +1689,7 @@ def _columns_json(columns, dtypes):
 def sheet_part(ctx, name, position, prescan, emit):
     """One sheet of a workbook as a part: is_asset false, part_type sheet, no bytes of its own. A sheet
     without data isn't a part; it is listed in the workbook's meta."""
-    safe = pg_safe_str(str(name)) or ("Sheet %d" % position)
+    safe = (pg_safe_str(str(name)) or ("Sheet %d" % position))[:PART_NAME_MAX]
     entry = {"name": safe, "position": position}
     try:
         data_rows, max_width = prescan()
@@ -2742,7 +2759,7 @@ def scan_part(ctx, open_fn, name, inner_path, declared=None, compressed=None, en
     ref = ctx.next_ref()
     clean_inner = pg_safe_str(inner_path or "") or pg_safe_str(name or "") or ref
     clean_name = pg_safe_str(name or "") or clean_inner.rsplit("/", 1)[-1] or ref
-    part = {"ref": ref, "parent_ref": ctx.parent_ref, "inner_path": clean_inner[:4000], "name": clean_name[:1000], "is_asset": True,
+    part = {"ref": ref, "parent_ref": ctx.parent_ref, "inner_path": clean_inner[:INNER_PATH_MAX], "name": clean_name[:PART_NAME_MAX], "is_asset": True,
             "part_type": part_type or "entry"}
     index = len(ctx.parts)
     ctx.parts.append(part)
@@ -2965,6 +2982,18 @@ _TABLE_COLUMNS_SQL = (
 _PG_DTYPES = {"N": "number", "D": "date", "B": "boolean"}
 
 
+def _db_types_meta(types):
+    """The columns' native types, as many as keep meta well under 16 KB; when the list is cut, meta says so
+    (architect note 2026-48-17)."""
+    out, size = [], 0
+    for t in types:
+        size += len(json.dumps(t, ensure_ascii=False).encode("utf-8")) + 2
+        if size > META_DB_TYPES_MAX:
+            return {"db_types": out, "db_types_cut": True, "db_types_count": len(types)}
+        out.append(t)
+    return {"db_types": out}
+
+
 def _pg_left_out(typname, elem):
     return typname == "bytea" or elem == "bytea"
 
@@ -3064,7 +3093,8 @@ def scan_table_object(obj, scope, conns):
                 seen[base] = 1
             names.append(base)
         columns = [{"name": names[i], "pos": i, "dtype": _PG_DTYPES.get(c[3], "string")} for i, c in enumerate(kept)]
-        meta = {"relkind": kind, "columns_left_out": left_out, "db_types": [c[4] for c in kept]}
+        meta = {"relkind": kind, "columns_left_out": left_out}
+        meta.update(_db_types_meta([c[4] for c in kept]))
         if not kept:
             conn.rollback()
             fields = {"outcome": "done", "content": None}
@@ -3160,7 +3190,7 @@ def _pg_reset(conn, conns):
 #   parameters, no prepared-statement cache. A refusal is matched on its HINT.
 # ===========================================================================
 CONTRACT_SQLSTATES = ("42883", "3F000", "42501", "42P01")
-LISTEN_CHANNELS = ("run_work",)
+LISTEN_CHANNELS = ("run_work", "run_request")    # run_request: queues changed; an idle worker asks at once (DB-82 §3)
 CALL_TIMEOUT_SEC = 120.0
 
 
@@ -3377,49 +3407,64 @@ def _has_classify(workers):
     return v is not None and v is not False
 
 
-def start_up_cleanup(settings):
-    """At start: the temporary folder's leftovers of this service, half-written working files of this
-    service, and run folders older than seven days (ruling 8). Returns the problem code or None."""
+def check_folders(settings):
+    """The folders the worker writes: DS_SCAN_TMP (its own subfolder), then DS_WORK_DIR. Each is created if
+    missing, listed, and written to. On the way, this service's leftovers are removed and run folders older
+    than seven days go (ruling 8). Returns (problem, removed): problem is None, or {setting, path, step,
+    error} for the first step that failed (step: create, list or write; error: the errno's name)."""
     removed = {"spool": 0, "tmp": 0, "runs": 0}
-    try:
-        os.makedirs(settings.scan_tmp, exist_ok=True)
-        spool = os.path.join(settings.scan_tmp, settings.service)
-        if os.path.isdir(spool):
-            for name in os.listdir(spool):
-                remove_tree(os.path.join(spool, name))
-                removed["spool"] += 1
-        os.makedirs(spool, exist_ok=True)
-        probe = os.path.join(spool, ".probe-%s" % uuid.uuid4().hex)
-        with open(probe, "wb") as fh:
+
+    def failed(setting, path, step, exc):
+        import errno as _errno
+        return {"setting": setting, "path": path, "step": step,
+                "error": _errno.errorcode.get(getattr(exc, "errno", None) or 0, type(exc).__name__)}
+
+    def probe(folder):
+        path = os.path.join(folder, ".probe-%s" % uuid.uuid4().hex)
+        with open(path, "wb") as fh:
             fh.write(b"x")
-        os.remove(probe)
-    except OSError:
-        return "work_dir_unusable", removed
+        os.remove(path)
+
+    spool = os.path.join(settings.scan_tmp, settings.service)
+    for step, act in (("create", lambda: os.makedirs(spool, exist_ok=True)), ("list", lambda: os.listdir(spool)), ("write", lambda: probe(spool))):
+        try:
+            act()
+        except OSError as e:
+            return failed("DS_SCAN_TMP", settings.scan_tmp if step == "create" and not os.path.isdir(settings.scan_tmp) else spool, step, e), removed
+    for name in os.listdir(spool):
+        remove_tree(os.path.join(spool, name))
+        removed["spool"] += 1
+
+    work = settings.work_dir
     try:
-        os.makedirs(settings.work_dir, exist_ok=True)
-        limit = time.time() - STALE_RUN_FOLDER_DAYS * 86400
-        prefix = ".tmp-%s-" % settings.service
-        for name in os.listdir(settings.work_dir):
-            run_dir = os.path.join(settings.work_dir, name)
-            if not name.isdigit() or not os.path.isdir(run_dir):
+        os.makedirs(work, exist_ok=True)
+    except OSError as e:
+        return failed("DS_WORK_DIR", work, "create", e), removed
+    try:
+        names = os.listdir(work)
+    except OSError as e:
+        return failed("DS_WORK_DIR", work, "list", e), removed
+    try:
+        probe(work)
+    except OSError as e:
+        return failed("DS_WORK_DIR", work, "write", e), removed
+    limit = time.time() - STALE_RUN_FOLDER_DAYS * 86400
+    prefix = ".tmp-%s-" % settings.service
+    for name in names:
+        run_dir = os.path.join(work, name)
+        if not name.isdigit() or not os.path.isdir(run_dir):
+            continue
+        try:
+            if os.stat(run_dir).st_mtime < limit:
+                remove_tree(run_dir)
+                removed["runs"] += 1
                 continue
-            try:
-                if os.stat(run_dir).st_mtime < limit:
-                    remove_tree(run_dir)
-                    removed["runs"] += 1
-                    continue
-                for inner in os.listdir(run_dir):
-                    if inner.startswith(prefix):
-                        remove_tree(os.path.join(run_dir, inner))
-                        removed["tmp"] += 1
-            except OSError:
-                continue
-        probe = os.path.join(settings.work_dir, ".probe-%s" % uuid.uuid4().hex)
-        with open(probe, "wb") as fh:
-            fh.write(b"x")
-        os.remove(probe)
-    except OSError:
-        return "work_dir_unusable", removed
+            for inner in os.listdir(run_dir):
+                if inner.startswith(prefix):
+                    remove_tree(os.path.join(run_dir, inner))
+                    removed["tmp"] += 1
+        except OSError:
+            continue
     return None, removed
 
 
@@ -3437,7 +3482,9 @@ class Worker(object):
         self.contract_ok = False
         self.contract_next = 0.0
         self.contract_tries = 0
-        self.dir_problem = None
+        self.dir_problem = None         # {setting, path, step, error} while a folder can't be used
+        self.dir_next = 0.0
+        self.dir_tries = 0
         self.set_aside = None
         self.capabilities = scan_capabilities(settings)
         self.version = "%s (connect %s)" % (VERSION, lib_version())
@@ -3470,7 +3517,7 @@ class Worker(object):
             elif not self.contract_ok and self.db.missing:
                 problem = health_item("contract_missing", missing=list(self.db.missing)[:20])
             elif self.dir_problem:
-                problem = health_item(self.dir_problem)
+                problem = health_item("work_dir_unusable", setting=self.dir_problem["setting"], step=self.dir_problem["step"])
             elif self.set_aside is not None:
                 problem = health_item("queue_set_aside", **self.set_aside)
             else:
@@ -3499,6 +3546,8 @@ class Worker(object):
     def _notified(self, channel, payload):
         if channel == "run_work" and self.queue is not None:
             self.queue.notified(payload)
+        elif channel == "run_request" and self.queue is None and self.wake is not None:
+            self.wake.set()
 
     def db_lost(self):
         if self.db.up:
@@ -3546,6 +3595,8 @@ class Worker(object):
                     await self._sleep_or_wake(delay)
                     delay = min(delay * 2, RECONNECT_MAX_SEC)
                     continue
+            if self.dir_problem is not None and time.monotonic() >= self.dir_next:
+                await self.check_folders()
             if self.db.up and not self.contract_ok and time.monotonic() >= self.contract_next:
                 try:
                     missing = await self.db.check_contract()
@@ -3566,6 +3617,27 @@ class Worker(object):
                     self.db_ready.set()
                     self.wake.set()
             await self._sleep_or_wake(1.0)
+
+    async def check_folders(self):
+        """Note 2026-48-22: a folder that can't be used is an error that names it and the step that failed;
+        it is checked again at 5, 15, 30 and then every 60 seconds, and the worker becomes ready once it is fixed."""
+        problem, removed = await self.loop.run_in_executor(self.executor, check_folders, self.s)
+        if problem is None:
+            if self.dir_problem is not None:
+                log.info(kv("folders_usable", work="resumes"))
+                self.wake.set()
+            else:
+                log.info(kv("start_up_cleanup", spool=removed["spool"], tmp=removed["tmp"], runs=removed["runs"]))
+            self.dir_problem = None
+            self.dir_tries = 0
+            return
+        self.dir_problem = problem
+        waits = (5, 15, 30)
+        wait = waits[self.dir_tries] if self.dir_tries < len(waits) else CONTRACT_RECHECK_SEC
+        self.dir_tries += 1
+        self.dir_next = time.monotonic() + wait
+        log.error(kv("folder_unusable", setting=problem["setting"], path=problem["path"], tried=problem["step"], error=problem["error"],
+                     work="none_until_fixed", next_check_sec=wait))
 
     async def _sleep_or_wake(self, sec):
         self.keeper_wake.clear()
@@ -3685,9 +3757,7 @@ class Worker(object):
         self.keeper_wake = asyncio.Event()
         self.done = asyncio.Event()
         self.executor = ThreadPoolExecutor(max_workers=self.s.threads + 2, thread_name_prefix="scan")
-        problem, removed = await self.loop.run_in_executor(self.executor, start_up_cleanup, self.s)
-        self.dir_problem = problem
-        log.info(kv("start_up_cleanup", spool=removed["spool"], tmp=removed["tmp"], runs=removed["runs"], problem=problem))
+        await self.check_folders()
         self.tasks.append(asyncio.ensure_future(self.keeper()))
         self.tasks.append(asyncio.ensure_future(self.heartbeat_loop()))
         try:
@@ -4287,26 +4357,26 @@ class QueueRun(object):
     def due(self):
         if not self.pending:
             return False
-        return (len(self.pending) + self.pending_parts >= BATCH_OBJECTS
+        return (len(self.pending) >= BATCH_OBJECTS or self.pending_parts >= PARTS_PER_CALL
                 or time.monotonic() - self.last_handin >= BATCH_SEC)
 
     def _calls(self, batch):
-        """The batch as calls of at most BATCH_OBJECTS elements, parts counted; an object with more parts
-        than a call holds goes over several, parts_final false on all but the last."""
-        limit = max(2, BATCH_OBJECTS)
-        per_call_parts = max(1, min(PARTS_PER_CALL, limit - 1))
+        """The batch as calls of at most BATCH_OBJECTS objects and PARTS_PER_CALL parts in all (db 2026-48-02:
+        10,000 and 50,000); an object with more parts than a call holds goes over several, parts_final false
+        on all but the last."""
+        limit = max(1, BATCH_OBJECTS)
+        per_call_parts = max(1, PARTS_PER_CALL)
         calls = []
         cur = []
         size = 0
         for e in batch:
             parts = e.get("parts") or []
             if len(parts) <= per_call_parts:
-                need = 1 + len(parts)
-                if cur and size + need > limit:
+                if cur and (len(cur) + 1 > limit or size + len(parts) > per_call_parts):
                     calls.append(cur)
                     cur, size = [], 0
                 cur.append(e)
-                size += need
+                size += len(parts)
                 continue
             if cur:
                 calls.append(cur)
@@ -4365,22 +4435,21 @@ class QueueRun(object):
         by_loc = {}
         for e in elements:
             by_loc.setdefault(e.get("location_id"), []).append(e)
+        # db 2026-48-02: became_skipped holds objects, became_skipped_parts and refused_parts hold [{location_id, ref}]
         for item in ans.get("became_skipped") or ():
-            if isinstance(item, dict):
-                for e in by_loc.get(item.get("location_id"), ()):
-                    self._remove_part_files(e, item.get("ref"))
-            else:
-                for e in by_loc.get(item, ()):
-                    self._remove_files(e)
-        for item in ans.get("refused_parts") or ():
-            if isinstance(item, dict):
-                for e in by_loc.get(item.get("location_id"), ()):
-                    self._remove_part_files(e, item.get("ref"))
+            for e in by_loc.get(item, ()):
+                self._remove_files(e)
+        for key in ("became_skipped_parts", "refused_parts"):
+            for item in ans.get(key) or ():
+                if isinstance(item, dict):
+                    for e in by_loc.get(item.get("location_id"), ()):
+                        self._remove_part_files(e, item.get("ref"))
         if ans.get("refused_parts"):
             log.warning(kv("parts_refused", run_id=self.run_id, parts=len(ans.get("refused_parts"))))
         log.info(kv("handed_in", run_id=self.run_id, partition_id=self.partition_id, received=ans.get("received"), done=ans.get("done"),
-                    skipped=ans.get("skipped"), failed=ans.get("failed"), already=ans.get("already"),
-                    became_skipped=len(ans.get("became_skipped") or ()), refused_parts=len(ans.get("refused_parts") or ())))
+                    skipped=ans.get("skipped"), failed=ans.get("failed"), already=ans.get("already"), waiting=ans.get("waiting"),
+                    parts=ans.get("parts"), became_skipped=len(ans.get("became_skipped") or ()),
+                    became_skipped_parts=len(ans.get("became_skipped_parts") or ()), refused_parts=len(ans.get("refused_parts") or ())))
         return True
 
     def _replace_refused(self, elements, detail):
@@ -4392,8 +4461,9 @@ class QueueRun(object):
             problems = []
         bad = {}
         for p in problems if isinstance(problems, list) else []:
-            if isinstance(p, dict) and isinstance(p.get("index"), int):
-                bad[p["index"]] = str(p.get("problem") or "invalid")[:100]
+            if isinstance(p, dict) and isinstance(p.get("index"), int) and p["index"] not in bad:
+                word = str(p.get("problem") or "invalid")[:60]
+                bad[p["index"]] = word if not isinstance(p.get("part"), int) else "%s in part %d" % (word, p["part"])
         if not bad:
             bad = {i: "the batch was refused" for i in range(len(elements))}
         out = []
@@ -4454,15 +4524,17 @@ class QueueRun(object):
             shas = sorted(set(s for s, _f in items))
             answer = {}
             try:
-                rows = await self.w.call("sys_get_known_content", v_sha256=shas, **self._key())
-                for r in rows or ():
-                    if isinstance(r, dict) and r.get("sha256"):
-                        answer[r["sha256"]] = r
-            except Refused as e:
-                if e.hint == "not_held":
+                # db 2026-48-02: {held: true, known: [{sha256, object_id, extracted, why, scan_version}]} or {held: false, why: not_held}
+                ans = await self.w.call("sys_get_known_content", v_sha256=shas, **self._key()) or {}
+                if ans.get("held") is False:
                     self.lost()
-            except Exception:
-                pass
+                for r in ans.get("known") or ():
+                    if isinstance(r, dict) and r.get("sha256"):
+                        answer[str(r["sha256"]).lower()] = r
+            except Refused as e:
+                log.warning(kv("lookup_refused", run_id=self.run_id, hint=e.hint))
+            except Exception as e:
+                log.warning(kv("lookup_failed", run_id=self.run_id, error=where(e)[0]))
             for s, f in items:
                 if not f.done():
                     f.set_result(answer.get(s))
