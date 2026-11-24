@@ -1,18 +1,16 @@
-# main.py - Data Sentinel Vantage V2 scan worker: settings, serve, exit (worker core standard 2026-48-11 §4, §15)
+# main.py - Data Sentinel Vantage V2 scan worker: start-up report, settings, serve, exit
+# (worker core standard 2026-48-11 §4, §15; architect note 2026-48-20)
 import os
 import sys
-import time
 
-from ds_scan import Settings, SettingsError, serve
+from ds_scan import SECRET_FILES, SETTINGS_SPEC, VERSION, Settings, lib_version, startup_report, serve
 
 
 def main():
-    try:
-        settings = Settings()
-    except SettingsError as e:
-        # one line that names the variable, in the log's format; exit code 2 before anything is served
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        sys.stdout.write("%s|ERROR|settings_invalid variable=%s problem=%s\n" % (stamp, e.variable, e.problem.replace(" ", "_")))
+    # what the container was given, written before the settings are checked; then settings_ok or settings_invalid
+    title = {"worker": "scan", "version": VERSION, "connect": lib_version(), "python": sys.version.split()[0]}
+    settings = startup_report(title, SETTINGS_SPEC, SECRET_FILES, Settings)
+    if settings is None:
         sys.stdout.flush()
         os._exit(2)
     code = serve(settings)

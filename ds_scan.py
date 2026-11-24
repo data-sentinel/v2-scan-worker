@@ -19,6 +19,8 @@
 #    9  the worker: check-in, heartbeat, claiming, the queue, renewals, hand-ins, stopping
 #   10  the endpoints and serve()
 #
+#__version__ = '2026.48.2'    # the start-up report (architect note 2026-48-20): what the container was given, before the
+#                              settings are checked; settings_invalid names the path it looked at
 #__version__ = '2026.48.1'    # first V2 build: directory and postgres through ds_connect_lib; txt, csv, json, xml, html,
 #                              pdf (behind one function), docx, pptx, xlsx, xls, zip at any depth; fingerprints and the
 #                              known-content skip; parts; working files; the standard's driver
@@ -55,7 +57,7 @@ import ds_connect_lib
 # ===========================================================================
 # 1. VERSIONS, SETTINGS, LOGGING, CATALOGUES
 # ===========================================================================
-VERSION = "2026.48.1"
+VERSION = "2026.48.2"
 WORKER_TYPE = "scan"
 STAGE = "scan"
 STANDARD = "worker-core-standard 2026-48-11"
@@ -116,10 +118,11 @@ PARAM_TYPES = {
 class SettingsError(Exception):
     """A setting that can't be used: the process stops before it serves anything (exit code 2)."""
 
-    def __init__(self, variable, problem):
+    def __init__(self, variable, problem, path=None):
         super().__init__(variable + ": " + problem)
         self.variable = variable
         self.problem = problem
+        self.path = path            # the file or folder looked at, when the problem is one
 
 
 def _read_secret_file(path):
@@ -162,8 +165,13 @@ class Settings(object):
         self.db_name = self._db_value("DS_DB_NAME", "repository_name", "data_sentinel")
         self.db_user = self._db_value("DS_DB_USER", "repository_username", "sentinel_worker")
         self.db_password_file = (env.get("DS_DB_PASSWORD_FILE") or self.secrets_dir + "/sentinel_worker_password").strip()
-        if not os.path.isfile(self.db_password_file):
-            raise SettingsError("DS_DB_PASSWORD_FILE", "no file at that path")
+        state = file_state(self.db_password_file)
+        if state == "cannot_tell":
+            raise SettingsError("DS_DB_PASSWORD_FILE", "its folder can't be looked into by this user", self.db_password_file)
+        if state == "not_found":
+            raise SettingsError("DS_DB_PASSWORD_FILE", "no file at that path", self.db_password_file)
+        if state == "found_unreadable":
+            raise SettingsError("DS_DB_PASSWORD_FILE", "the file can't be read by this user", self.db_password_file)
 
         self.poll_sec = self._int("DS_POLL_SEC", 5, 1, 20)
         self.log_dir = (env.get("DS_LOG_DIR") or "/mnt/logs").strip()
@@ -175,11 +183,11 @@ class Settings(object):
         roots = [r.strip() for r in (env.get("DS_FILE_ROOTS") or "").split(":") if r.strip()]
         for r in roots:
             if not os.path.isabs(r):
-                raise SettingsError("DS_FILE_ROOTS", "every root must be an absolute path")
+                raise SettingsError("DS_FILE_ROOTS", "every root must be an absolute path", r)
         self.file_roots = roots
         self.ca_bundle = (env.get("DS_CA_BUNDLE") or "").strip() or None
-        if self.ca_bundle and not os.path.isfile(self.ca_bundle):
-            raise SettingsError("DS_CA_BUNDLE", "no file at that path")
+        if self.ca_bundle and file_state(self.ca_bundle) != "found":
+            raise SettingsError("DS_CA_BUNDLE", "no readable file at that path", self.ca_bundle)
         self.https_proxy = (env.get("HTTPS_PROXY") or env.get("https_proxy") or "").strip() or None
         self.no_proxy = (env.get("NO_PROXY") or env.get("no_proxy") or "").strip() or None
 
@@ -219,7 +227,7 @@ class Settings(object):
     def _abs(self, name, default):
         value = (self._env.get(name) or default).strip()
         if not os.path.isabs(value):
-            raise SettingsError(name, "must be an absolute path")
+            raise SettingsError(name, "must be an absolute path", value)
         return value.rstrip("/") or "/"
 
     def _db_value(self, env_name, secret_name, default):
@@ -227,11 +235,16 @@ class Settings(object):
         if value:
             return value
         path = self.secrets_dir + "/" + secret_name
-        if os.path.isfile(path):
+        state = file_state(path)
+        if state == "cannot_tell":
+            raise SettingsError(env_name, "the secrets folder can't be looked into by this user", self.secrets_dir)
+        if state == "found_unreadable":
+            raise SettingsError(env_name, "the secret file " + secret_name + " can't be read by this user", path)
+        if state == "found":
             try:
                 value = _read_secret_file(path).strip()
-            except OSError:
-                raise SettingsError(env_name, "the secret " + secret_name + " can't be read")
+            except (OSError, UnicodeError):
+                raise SettingsError(env_name, "the secret file " + secret_name + " can't be read", path)
             if value:
                 return value
         return default
@@ -250,8 +263,7 @@ class Settings(object):
 
     def summary(self):
         """The start line's settings: no secret and no connection value beyond the host."""
-        return {"service": self.service, "port": self.port, "db_host": self.db_host, "db_port": self.db_port, "db_name": self.db_name,
-                "db_user": self.db_user, "poll_sec": self.poll_sec, "file_roots": len(self.file_roots),
+        return {"service": self.service, "port": self.port, "poll_sec": self.poll_sec, "file_roots": len(self.file_roots),
                 "ca_bundle": bool(self.ca_bundle), "proxy": bool(self.https_proxy), "work_dir": self.work_dir,
                 "scan_tmp": self.scan_tmp, "threads": self.threads, "memory_mb": self.memory_mb,
                 "archive_max_depth": self.archive_max_depth, "archive_max_mb": self.archive_max_mb,
@@ -259,6 +271,242 @@ class Settings(object):
                 "archive_max_ratio": self.archive_max_ratio, "archive_ratio_min_mb": self.archive_ratio_min_mb,
                 "scan_tmp_max_mb": self.scan_tmp_max_mb, "object_max_mb": self.object_max_mb,
                 "work_min_free_mb": self.work_min_free_mb, "log_level": self.log_level}
+
+
+def file_state(path):
+    """found, not_found, found_unreadable, or cannot_tell (its folder can't be looked into). Opens the
+    file to know whether it can be read; never reads it."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "not_found"
+    except NotADirectoryError:
+        return "not_found"
+    except PermissionError:
+        return "cannot_tell"
+    except OSError:
+        return "not_found"
+    if not stat.S_ISREG(st.st_mode):
+        return "not_found"
+    try:
+        with open(path, "rb"):
+            pass
+    except PermissionError:
+        return "found_unreadable"
+    except OSError:
+        return "found_unreadable"
+    return "found"
+
+
+# ---------------------------------------------------------------------------
+# 1.1 the start-up report (architect note 2026-48-20): what the container was given, and what it wasn't
+#   SETTINGS_SPEC is this worker's; startup_report() has nothing of scan in it, for the standard's next edition.
+#   Kinds: value (shown), connection (set or not set, never the value), path (a file, shown), dir_write (a folder
+#   the worker writes, shown and checked), dirs_read (folders separated by colons, shown, each checked for reading).
+#   The default is what is shown when the variable isn't set: a text, a function of the environment, or None.
+# ---------------------------------------------------------------------------
+SECRET_FILES = ("repository_host", "repository_port", "repository_name", "repository_username", "sentinel_worker_password")
+SETTINGS_SPEC = (
+    ("DS_SERVICE", "value", None),
+    ("DS_SERVICE_PORT", "value", "5540"),
+    ("DS_SERVICE_EXTERNAL_HOST", "connection", "the service's name"),
+    ("DS_SERVICE_EXTERNAL_PORT", "value", lambda env: (env.get("DS_SERVICE_PORT") or "").strip() or "5540"),
+    ("DS_SECRETS_DIR", "path", "/run/secrets"),
+    ("DS_DB_HOST", "connection", "the secret file repository_host"),
+    ("DS_DB_PORT", "connection", "the secret file repository_port, else the standard's"),
+    ("DS_DB_NAME", "connection", "the secret file repository_name, else the standard's"),
+    ("DS_DB_USER", "connection", "the secret file repository_username, else the standard's"),
+    ("DS_DB_PASSWORD_FILE", "path", lambda env: ((env.get("DS_SECRETS_DIR") or "/run/secrets").rstrip("/") or "") + "/sentinel_worker_password"),
+    ("DS_POLL_SEC", "value", "5"),
+    ("DS_LOG_DIR", "dir_write", "/mnt/logs"),
+    ("DS_LOG_LEVEL", "value", "info"),
+    ("DS_FILE_ROOTS", "dirs_read", None),
+    ("DS_CA_BUNDLE", "path", None),
+    ("HTTPS_PROXY", "connection", None, ("https_proxy",)),
+    ("NO_PROXY", "connection", None, ("no_proxy",)),
+    ("DS_WORK_DIR", "dir_write", "/mnt/datasets"),
+    ("DS_SCAN_TMP", "dir_write", "/mnt/scan_tmp"),
+    ("DS_SCAN_THREADS", "value", "4"),
+    ("DS_SCAN_MEMORY_MB", "value", "8"),
+    ("DS_ARCHIVE_MAX_DEPTH", "value", "8"),
+    ("DS_ARCHIVE_MAX_MB", "value", "20480"),
+    ("DS_ARCHIVE_ENTRY_MAX_MB", "value", "4096"),
+    ("DS_ARCHIVE_MAX_ENTRIES", "value", "200000"),
+    ("DS_ARCHIVE_MAX_RATIO", "value", "200"),
+    ("DS_ARCHIVE_RATIO_MIN_MB", "value", "1"),
+    ("DS_SCAN_TMP_MAX_MB", "value", "51200"),
+    ("DS_OBJECT_MAX_MB", "value", "51200"),
+    ("DS_WORK_MIN_FREE_MB", "value", "2048"),
+)
+
+
+def startup_report(title, settings_spec, secret_files, check, env=None):
+    """Writes, before the settings are checked, what the container was given: who the process runs as,
+    every setting (connection values as set or not set only), the secrets folder, each secret file and
+    the password file (found, not found, or found but unreadable: never their content or length), each
+    folder the worker needs, and DS_ variables the worker doesn't know. Then runs check(): settings_ok,
+    or settings_invalid with the variable, the problem and the path looked at. One line per item, in the
+    log's format, to stdout and to <DS_LOG_DIR>/<DS_SERVICE>.log when that folder can be used.
+    Returns check()'s result, or None when the settings can't be used (the caller exits 2).
+    Standard names it relies on: DS_SERVICE, DS_LOG_DIR, DS_SECRETS_DIR, DS_DB_PASSWORD_FILE."""
+    import json as _json
+    import logging as _logging
+    import os as _os
+    import re as _re
+    import stat as _stat
+    import sys as _sys
+
+    env = _os.environ if env is None else env
+
+    def q(value):
+        text = str(value)
+        if len(text) > 500:
+            text = text[:500] + "..."
+        if text == "" or any(ch in text for ch in ' \t|="\\') or not text.isprintable():
+            return _json.dumps(text, ensure_ascii=False)
+        return text
+
+    def line(event, **fields):
+        return event + "".join(" %s=%s" % (k, q(v)) for k, v in fields.items())
+
+    def state_of(path):
+        try:
+            st = _os.stat(path)
+        except PermissionError:
+            return "cannot_tell"
+        except OSError:
+            return "not_found"
+        if not _stat.S_ISREG(st.st_mode):
+            return "not_found"
+        try:
+            with open(path, "rb"):
+                pass
+        except OSError:
+            return "found_unreadable"
+        return "found"
+
+    def folder(path, mode):
+        try:
+            st = _os.stat(path)
+        except PermissionError:
+            return "cannot_tell", "no"
+        except OSError:
+            return "no", "no"
+        if not _stat.S_ISDIR(st.st_mode):
+            return "not_a_folder", "no"
+        if mode == "write":
+            ok = _os.access(path, _os.W_OK | _os.X_OK)
+        else:
+            ok = _os.access(path, _os.R_OK | _os.X_OK)
+        return "yes", "yes" if ok else "no"
+
+    def raw(name, aliases=()):
+        for n in (name,) + tuple(aliases):
+            v = env.get(n)
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
+        return None
+
+    # where the lines go: stdout, and the log file when the folder can be used
+    logger = _logging.getLogger("startup_report")
+    logger.propagate = False
+    logger.setLevel(_logging.INFO)
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    fmt = _logging.Formatter("%(asctime)s|%(levelname)s|%(message)s")
+    handlers = [_logging.StreamHandler(_sys.stdout)]
+    service = raw("DS_SERVICE") or ""
+    log_dir = raw("DS_LOG_DIR") or "/mnt/logs"
+    log_file = None
+    if _re.match(r"^[A-Za-z0-9_.-]{1,60}$", service) and folder(log_dir, "write") == ("yes", "yes"):
+        try:
+            log_file = _logging.FileHandler(_os.path.join(log_dir, service + ".log"), mode="a", encoding="utf-8")
+            handlers.append(log_file)
+        except OSError:
+            log_file = None
+    for h in handlers:
+        h.setFormatter(fmt)
+        logger.addHandler(h)
+
+    try:
+        logger.info(line("startup_report", **title))
+        # 1. who it runs as
+        logger.info(line("startup_user", uid=_os.getuid(), gid=_os.getgid()))
+        # 2. every setting the worker knows, in a fixed order
+        folders = []
+        known = set()
+        for item in settings_spec:
+            name, kind, default = item[0], item[1], item[2]
+            aliases = tuple(item[3]) if len(item) > 3 else ()
+            known.add(name)
+            known.update(a for a in aliases if a.startswith("DS_"))
+            value = raw(name, aliases)
+            is_set = value is not None
+            if not is_set:
+                default = default(env) if callable(default) else default
+            if kind == "connection":
+                if is_set:
+                    logger.info(line("startup_setting", name=name, state="set"))
+                elif default is None:
+                    logger.info(line("startup_setting", name=name, state="not_set"))
+                else:
+                    logger.info(line("startup_setting", name=name, state="not_set", default=default))
+                continue
+            shown = value if is_set else (default if default is not None else "none")
+            logger.info(line("startup_setting", name=name, state="set" if is_set else "not_set", value=shown))
+            if kind == "dir_write":
+                folders.append((name, value or default, "write"))
+            elif kind == "dirs_read" and (value or default):
+                for p in [x.strip() for x in str(value or default).split(":") if x.strip()]:
+                    folders.append((name, p, "read"))
+        # 3. the secrets folder
+        secrets_dir = (raw("DS_SECRETS_DIR") or "/run/secrets").rstrip("/") or "/"
+        exists, _w = folder(secrets_dir, "read")
+        can_look = "no"
+        if exists == "yes":
+            try:
+                _os.listdir(secrets_dir)
+                can_look = "yes"
+            except OSError:
+                can_look = "no"
+        logger.info(line("startup_secrets_folder", path=secrets_dir, exists=exists, can_look_in=can_look))
+        # 4. each secret file the worker looks for: the state only
+        for name in secret_files:
+            st = state_of(_os.path.join(secrets_dir, name))
+            (logger.info if st == "found" else logger.warning)(line("startup_secret_file", name=name, state=st))
+        # 5. the password file in use
+        pw = raw("DS_DB_PASSWORD_FILE") or (secrets_dir.rstrip("/") + "/sentinel_worker_password")
+        st = state_of(pw)
+        (logger.info if st == "found" else logger.warning)(line("startup_password_file", path=pw, state=st))
+        # 6. each folder it needs
+        for name, path, mode in folders:
+            exists, ok = folder(path, mode)
+            fields = {"setting": name, "path": path, "exists": exists}
+            fields["writable" if mode == "write" else "readable"] = ok
+            (logger.info if (exists == "yes" and ok == "yes") else logger.warning)(line("startup_folder", **fields))
+        # 7. DS_ variables this worker doesn't know: names only
+        for name in sorted(k for k in env if k.startswith("DS_") and k not in known):
+            logger.warning(line("startup_unknown_variable", name=name))
+        # the result
+        try:
+            result = check()
+        except Exception as e:
+            fields = {"variable": getattr(e, "variable", "-"), "problem": str(getattr(e, "problem", type(e).__name__)).replace(" ", "_")}
+            if getattr(e, "path", None):
+                fields["path"] = e.path
+            logger.error(line("settings_invalid", **fields))
+            return None
+        logger.info("settings_ok")
+        return result
+    finally:
+        for h in handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+            logger.removeHandler(h)
+        if log_file is not None:
+            log_file.close()
 
 
 log = logging.getLogger("ds_scan")
@@ -3293,7 +3541,7 @@ class Worker(object):
                     self.contract_ok = False
                     self.contract_next = 0.0
                     self.contract_tries = 0
-                    log.info(kv("database_connected", db_host=self.s.db_host, db_port=self.s.db_port))
+                    log.info(kv("database_connected", links=2))
                 except DbAway:
                     await self._sleep_or_wake(delay)
                     delay = min(delay * 2, RECONNECT_MAX_SEC)
