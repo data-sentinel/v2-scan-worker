@@ -1,6 +1,6 @@
-# Data Sentinel Vantage V2 scan worker 2026.48.4 - worker core standard 2026-48-37 §2
+# Data Sentinel Vantage V2 scan worker 2026.48.5 - worker core standard 2026-48-37 §2
 # Builds for linux/amd64 and linux/arm64, wheels only. No Java, no Oracle client, no ODBC.
-#   docker buildx build --platform linux/amd64,linux/arm64 --build-arg DS_UID=<uid> --build-arg DS_GID=<gid> -t ds_scan:2026.48.4 .
+#   docker buildx build --platform linux/amd64,linux/arm64 --build-arg DS_UID=<uid> --build-arg DS_GID=<gid> -t ds_scan:2026.48.5 .
 FROM python:3.13-slim-trixie
 
 ARG DS_UID=10001

@@ -19,6 +19,8 @@
 #    9  the worker: check-in, heartbeat, claiming, the queue, renewals, hand-ins, stopping
 #   10  the endpoints and serve()
 #
+#__version__ = '2026.48.5'    # labels from docMetadata/LabelInfo.xml; a PDF's XMP and MSIP labels, and meta.pdf (version,
+#                              encryption, permissions, form, signatures); an HTML page's title and meta tags (note 2026-48-48)
 #__version__ = '2026.48.4'    # the worker's report as a document, sent at check-in (v_report) and again when it changes; reads
 #                              with why, loaded readers (standard 2026-48-37); a known container with parts_unread opened again
 #                              in a run with classify (note 2026-48-39); document properties in meta.doc, meta.labels and
@@ -64,7 +66,7 @@ import ds_connect_lib
 # ===========================================================================
 # 1. VERSIONS, SETTINGS, LOGGING, CATALOGS
 # ===========================================================================
-VERSION = "2026.48.4"
+VERSION = "2026.48.5"
 WORKER_TYPE = "scan"
 STAGE = "scan"
 STANDARD = "worker-core-standard 2026-48-37"
@@ -2483,12 +2485,92 @@ def _read_markup(src, ctx, html_mode):
         raise
 
 
+_HTML_META_NAMES = {"author": "author", "description": "comments", "keywords": "keywords", "generator": "application"}
+HTML_HEAD_MAX = 256 * 1024
+
+
+class _HtmlProps(object):
+    """The page's <title> and the author, description, keywords and generator of its <meta> tags, up to <body>
+    (architect note 2026-48-48 §3.4). Customer text: never logged."""
+
+    def __init__(self):
+        self.doc = {}
+        self.title = None
+        self.done = False
+
+    def start(self, tag, attrib, nsmap=None):
+        if self.done:
+            return
+        name = _HtmlTarget._name(tag)
+        if name == "body":
+            self.done = True
+        elif name == "title" and "title" not in self.doc and self.title is None:
+            self.title = []
+        elif name == "meta":
+            key = _HTML_META_NAMES.get((attrib.get("name") or "").strip().lower())
+            content = (attrib.get("content") or "").strip()
+            if key and content and key not in self.doc:
+                self.doc[key] = _prop_text(_WS_RE.sub(" ", content))
+
+    def end(self, tag):
+        name = _HtmlTarget._name(tag)
+        if name == "title" and self.title is not None:
+            text = _WS_RE.sub(" ", "".join(self.title)).strip()
+            if text:
+                self.doc["title"] = _prop_text(text)
+            self.title = None
+        elif name == "head":
+            self.done = True
+
+    def data(self, text):
+        if self.title is not None and not self.done:
+            self.title.append(text)
+
+    def comment(self, text):
+        pass
+
+    def close(self):
+        return None
+
+
+def html_properties(src, ctx):
+    """meta.doc of a page, from at most its first HTML_HEAD_MAX bytes, with or without a classify stage.
+    A page that can't be read for them gives nothing; the object doesn't fail."""
+    from lxml import etree
+    props = _HtmlProps()
+    try:
+        parser = etree.HTMLParser(target=props, recover=True, no_network=True, remove_comments=True, remove_pis=True)
+        decoder = codecs.getincrementaldecoder(_html_encoding(src.head))(errors="replace")
+        with src.open() as fh:
+            left = HTML_HEAD_MAX
+            while left > 0 and not props.done:
+                ctx.check()
+                chunk = fh.read(min(64 * 1024, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+                parser.feed(decoder.decode(chunk))
+        try:
+            parser.close()
+        except etree.XMLSyntaxError:
+            pass
+    except (ScanFail, QueueAbort, Stopped):
+        raise
+    except Exception:
+        return {}
+    return {"doc": props.doc} if props.doc else {}
+
+
 def read_xml(src, ctx, ti):
     return _read_markup(src, ctx, False)
 
 
 def read_html(src, ctx, ti):
-    return _read_markup(src, ctx, True)
+    meta = html_properties(src, ctx)
+    out = _read_markup(src, ctx, True)
+    if meta:
+        out["meta"] = dict(out.get("meta") or {}, **meta)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2524,7 +2606,87 @@ class PdfDocument(object):
             md.update(pdf_properties(self._doc.metadata))
         except Exception:
             pass
+        labels = collections.OrderedDict()
+        try:
+            for (label_id, field), value in self._info_labels().items():
+                _add_label_prop(labels, label_id, field, value)
+        except Exception:
+            pass
+        try:
+            xmp_doc, xmp_labels = pdf_xmp(self._doc.get_xml_metadata())
+            for name, value in xmp_doc.items():          # the info dictionary first; XMP fills what it lacks
+                md.setdefault("doc", {}).setdefault(name, value)
+            for (label_id, field), value in xmp_labels.items():
+                if _LABEL_FIELDS.get(field) not in labels.get(_guid(label_id), {}):
+                    _add_label_prop(labels, label_id, field, value)
+        except Exception:
+            pass
+        if labels:
+            md["labels"] = _label_list(labels)
+        try:
+            md["pdf"] = self._security()
+        except Exception:
+            pass
         self.meta = md
+
+    def _info_labels(self):
+        """The MSIP_Label_* keys of the info dictionary, where a labeled Office file saved as PDF can keep them."""
+        out = collections.OrderedDict()
+        kind, ref = self._doc.xref_get_key(-1, "Info")
+        if kind != "xref":
+            return out
+        info = int(ref.split()[0])
+        for key in self._doc.xref_get_keys(info):
+            m = _LABEL_RE.match(key)
+            if m:
+                vkind, value = self._doc.xref_get_key(info, key)
+                if vkind in ("string", "name", "bool", "int"):
+                    out[(m.group(1), m.group(2))] = value.lstrip("/")
+        return out
+
+    def _security(self):
+        """meta.pdf (note 2026-48-48 §3.3): the PDF version, whether it is encrypted, what its permissions allow,
+        whether it has a form, and how many signature fields are signed. A signature is counted, never verified."""
+        md = self._doc.metadata or {}
+        fmt = (md.get("format") or "").strip()
+        perms = self._doc.permissions
+        fields, signed, xfa = self._form_fields()
+        return {"version": fmt[4:] if fmt.upper().startswith("PDF ") else (fmt or None),
+                "encrypted": bool(md.get("encryption")),
+                "permissions": {name: bool(perms & bit) for name, bit in _PDF_PERMS},
+                "form": bool(fields or xfa),
+                "signatures": signed}
+
+    def _form_fields(self):
+        """The form's fields, walked from the catalog's AcroForm without loading a page: (fields, signed signature
+        fields, has XFA). A field's type is inherited from its parent. At most PDF_FIELDS_MAX nodes."""
+        doc = self._doc
+        cat = doc.pdf_catalog()
+        kind, _v = doc.xref_get_key(cat, "AcroForm/XFA")
+        xfa = kind not in ("null", "")
+        kind, value = doc.xref_get_key(cat, "AcroForm/Fields")
+        if kind != "array":
+            return 0, 0, xfa
+        refs = re.compile(r"(\d+)\s+\d+\s+R")
+        todo = [(int(x), None) for x in refs.findall(value)]
+        seen, fields, signed = set(), 0, 0
+        while todo and len(seen) < PDF_FIELDS_MAX:
+            xref, parent_type = todo.pop()
+            if xref in seen:
+                continue
+            seen.add(xref)
+            ft_kind, ft = doc.xref_get_key(xref, "FT")
+            ftype = ft if ft_kind == "name" else parent_type
+            kids_kind, kids = doc.xref_get_key(xref, "Kids")
+            kid_refs = refs.findall(kids) if kids_kind == "array" else []
+            named_kids = [int(k) for k in kid_refs if doc.xref_get_key(int(k), "T")[0] != "null"]
+            if named_kids:
+                todo.extend((k, ftype) for k in named_kids)
+                continue
+            fields += 1
+            if ftype == "/Sig" and doc.xref_get_key(xref, "V")[0] in ("xref", "dict"):
+                signed += 1
+        return fields, signed, xfa
 
     def pages(self):
         for i in range(self._doc.page_count):
@@ -2658,13 +2820,15 @@ def _xml_root(zf, name):
 
 def _props_parts(zf):
     """Where the package keeps its three property parts: by its relationships, else the usual names."""
-    found = {"core": "docProps/core.xml", "app": "docProps/app.xml", "custom": "docProps/custom.xml"}
+    found = {"core": "docProps/core.xml", "app": "docProps/app.xml", "custom": "docProps/custom.xml",
+             "labelinfo": "docMetadata/LabelInfo.xml"}
     root = _xml_root(zf, "_rels/.rels")
     if root is not None:
         for rel in root:
             rtype = rel.get("Type") or ""
             target = (rel.get("Target") or "").lstrip("/")
-            for key, tail in (("core", "/core-properties"), ("app", "/extended-properties"), ("custom", "/custom-properties")):
+            for key, tail in (("core", "/core-properties"), ("app", "/extended-properties"), ("custom", "/custom-properties"),
+                              ("labelinfo", "/classificationlabels")):
                 if rtype.endswith(tail) and target:
                     found[key] = target
     return found
@@ -2690,6 +2854,53 @@ def _custom_value(prop):
             return iso_date(text)
         return _prop_text(text, CUSTOM_VALUE_MAX)
     return None
+
+
+def _guid(text):
+    """A label or site id as the app compares them: no braces, lower case."""
+    return _prop_text(text or "", 64).strip("{}").lower()
+
+
+def _add_label_prop(labels, label_id, field, value):
+    """One MSIP_Label_<id>_<field> property (custom.xml, a PDF's info or its XMP) into the labels by id."""
+    field = _LABEL_FIELDS.get(field)
+    label = labels.setdefault(_guid(label_id), {"id": _guid(label_id)})
+    if field == "enabled":
+        label["enabled"] = value if isinstance(value, bool) else str(value).strip().lower() in ("true", "1")
+    elif field == "set_at":
+        label["set_at"] = iso_date(str(value))
+    elif field == "site_id" and value not in (None, ""):
+        label["site_id"] = _guid(str(value))
+    elif field and value not in (None, ""):
+        label[field] = _prop_text(value, CUSTOM_VALUE_MAX)
+
+
+def _labelinfo_labels(zf, name, labels):
+    """docMetadata/LabelInfo.xml, where newer Office versions keep the label (architect note 2026-48-48 §3.1): an id,
+    whether it is enabled, the method and the site, but no name. Where custom.xml has the same id, its name and date
+    stay and this part's enabled, method and site win. A label marked removed is not on the file and is left out."""
+    root = _xml_root(zf, name)
+    if root is None:
+        return
+    for el in root.iter():
+        if not isinstance(el.tag, str) or _xl_local(el.tag) != "label":
+            continue
+        lid = _guid(el.get("id"))
+        if not lid or (el.get("removed") or "").strip().lower() in ("1", "true"):
+            continue
+        label = labels.setdefault(lid, {"id": lid})
+        enabled = el.get("enabled")
+        if enabled is not None and enabled.strip():
+            label["enabled"] = enabled.strip().lower() in ("1", "true")
+        if (el.get("method") or "").strip():
+            label["method"] = _prop_text(el.get("method"), CUSTOM_VALUE_MAX)
+        if (el.get("siteId") or "").strip():
+            label["site_id"] = _guid(el.get("siteId"))
+
+
+def _label_list(labels):
+    return [dict(id=lb["id"], name=lb.get("name"), enabled=lb.get("enabled"), set_at=lb.get("set_at"),
+                 method=lb.get("method"), site_id=lb.get("site_id")) for lb in labels.values()]
 
 
 def office_properties(zf):
@@ -2724,9 +2935,9 @@ def office_properties(zf):
                     pass
     if doc:
         out["doc"] = doc
+    labels = collections.OrderedDict()
     custom_root = _xml_root(zf, parts["custom"])
     if custom_root is not None:
-        labels = collections.OrderedDict()
         custom = {}
         for prop in custom_root:
             name = (prop.get("name") or "").strip()
@@ -2735,23 +2946,16 @@ def office_properties(zf):
             value = _custom_value(prop)
             m = _LABEL_RE.match(name)
             if m:
-                field = _LABEL_FIELDS.get(m.group(2))
-                label = labels.setdefault(m.group(1).lower(), {"id": m.group(1).lower()})
-                if field == "enabled":
-                    label["enabled"] = value if isinstance(value, bool) else str(value).strip().lower() == "true"
-                elif field == "set_at":
-                    label["set_at"] = iso_date(str(value))
-                elif field and value not in (None, ""):
-                    label[field] = _prop_text(value, CUSTOM_VALUE_MAX)
+                _add_label_prop(labels, m.group(1), m.group(2), value)
                 continue
             if value in (None, "") or len(custom) >= CUSTOM_MAX:
                 continue
             custom[_prop_text(name, CUSTOM_VALUE_MAX)] = value
-        if labels:
-            out["labels"] = [dict(id=lb["id"], name=lb.get("name"), enabled=lb.get("enabled"), set_at=lb.get("set_at"),
-                                  method=lb.get("method"), site_id=lb.get("site_id")) for lb in labels.values()]
         if custom:
             out["custom"] = custom
+    _labelinfo_labels(zf, parts["labelinfo"], labels)
+    if labels:
+        out["labels"] = _label_list(labels)
     return out
 
 
@@ -2766,6 +2970,82 @@ def pdf_properties(info):
         if v and str(v).strip():
             doc[name] = iso_date(str(v)) if name in _DATE_NAMES else _prop_text(v)
     return {"doc": doc} if doc else {}
+
+
+_RDF_NS = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
+# XMP's names onto the vocabulary of note 2026-48-45 (note 2026-48-48 §3.2). dc:description is the PDF's Subject.
+_XMP_NAMES = {("http://purl.org/dc/elements/1.1/", "title"): "title",
+              ("http://purl.org/dc/elements/1.1/", "creator"): "author",
+              ("http://purl.org/dc/elements/1.1/", "description"): "subject",
+              ("http://purl.org/dc/elements/1.1/", "subject"): "keywords",
+              ("http://purl.org/dc/elements/1.1/", "language"): "language",
+              ("http://ns.adobe.com/pdf/1.3/", "Keywords"): "keywords",
+              ("http://ns.adobe.com/pdf/1.3/", "Producer"): "producer",
+              ("http://ns.adobe.com/xap/1.0/", "CreatorTool"): "application",
+              ("http://ns.adobe.com/xap/1.0/", "CreateDate"): "created",
+              ("http://ns.adobe.com/xap/1.0/", "ModifyDate"): "modified"}
+_XMP_JOIN = {"author": "; ", "keywords": ", ", "language": ", "}
+XMP_MAX = 1 * _MB
+
+
+def _xmp_split(tag):
+    if isinstance(tag, str) and tag.startswith("{"):
+        ns, local = tag[1:].split("}", 1)
+        return ns, local
+    return "", tag if isinstance(tag, str) else ""
+
+
+def _xmp_value(el):
+    """An XMP property's value: its text, or the items of its rdf:Alt, rdf:Seq or rdf:Bag."""
+    items = [(li.text or "").strip() for li in el.iter(_RDF_NS + "li")]
+    items = [t for t in items if t]
+    if items:
+        return items
+    text = (el.text or "").strip()
+    return [text] if text else []
+
+
+def pdf_xmp(xml_text):
+    """A PDF's XMP packet: (the vocabulary's names it has, the MSIP_Label_* properties as {(id, field): value}).
+    A packet that can't be read gives nothing."""
+    from lxml import etree
+    doc, label_props = {}, collections.OrderedDict()
+    if not xml_text or len(xml_text) > XMP_MAX:
+        return doc, label_props
+    try:
+        data = xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text
+        root = etree.fromstring(data, parser=etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False,
+                                                              huge_tree=False, recover=True))
+    except Exception:
+        return doc, label_props
+    if root is None:
+        return doc, label_props
+
+    def take(ns, local, values):
+        m = _LABEL_RE.match(local)
+        if m:
+            if values:
+                label_props.setdefault((m.group(1), m.group(2)), values[0])
+            return
+        name = _XMP_NAMES.get((ns, local))
+        if name and values and name not in doc:
+            text = _XMP_JOIN.get(name, " ").join(values) if name in _XMP_JOIN else values[0]
+            doc[name] = iso_date(text) if name in _DATE_NAMES else _prop_text(text)
+
+    for desc in root.iter(_RDF_NS + "Description"):
+        for attr, value in desc.attrib.items():          # properties written as attributes of rdf:Description
+            ns, local = _xmp_split(attr)
+            if ns != _RDF_NS[1:-1] and (value or "").strip():
+                take(ns, local, [value.strip()])
+        for el in desc:
+            ns, local = _xmp_split(el.tag)
+            take(ns, local, _xmp_value(el))
+    return doc, label_props
+
+
+_PDF_PERMS = (("print", 4), ("print_high", 2048), ("modify", 8), ("copy", 16), ("annotate", 32), ("fill_forms", 256),
+              ("accessibility", 512), ("assemble", 1024))
+PDF_FIELDS_MAX = 5000
 
 
 def _embedded_entries(zf):
@@ -2997,9 +3277,19 @@ def skip_known(known, ti, write):
     """Ruling 7: skip what was extracted, and what wasn't when this build still can't read that type.
     A known container: its parts come from the database (ruling 6), unless parts_unread says some of them
     wait for a classify stage this run has (DB-82 §6). Known without a classify stage: read again only when
-    this run has one."""
+    this run has one.
+    From db 2026-48-07 the answer has read_again (note 2026-48-54): the database's own rule, which replaces
+    parts_unread and the no_classify_stage case. True: read it again with its extract, or open the container
+    (only when this run writes extracts). False: skipped as known, a container and content held as
+    no_classify_stage included; ruling 7 still reads a type this build can now read."""
     if not known:
         return False
+    if "read_again" in known:
+        if known.get("read_again") is True and write:
+            return False
+        if known.get("extracted") or known.get("why") in ("container", "no_classify_stage"):
+            return True
+        return ti.reader is None
     if known.get("extracted"):
         return True
     why = known.get("why")
@@ -3764,6 +4054,21 @@ def _has_classify(workers):
     return v is not None and v is not False
 
 
+def run_writes(block):
+    """Whether a run's scan writes extracts: its workers have a classify stage and, from db 2026-48-07, its
+    classifications list isn't empty. A run whose list is empty has nothing to classify; scan works as in a run
+    without a classify stage, whatever the claim says of the stage (note 2026-48-54 §3). Absent list: as before."""
+    if not _has_classify((block or {}).get("workers")):
+        return False
+    names = (block or {}).get("classifications")
+    return not (isinstance(names, list) and not names)
+
+
+def _classifications_seen(block):
+    names = (block or {}).get("classifications")
+    return len(names) if isinstance(names, list) else "absent"
+
+
 def check_folders(settings):
     """The folders the worker writes: DS_SCAN_TMP (its own subfolder), then DS_WORK_DIR. Each is created if
     missing, listed, and written to. On the way, this service's leftovers are removed and run folders older
@@ -4277,7 +4582,7 @@ class QueueRun(object):
         self.resumed = resumed
         self.source_type = str(self.block.get("source_type") or "")
         self.data_source_id = self.block.get("data_source_id")
-        self.write = _has_classify(self.block.get("workers"))
+        self.write = run_writes(self.block)
         self.full = str(self.block.get("run_mode") or "") == "force"
         cp = self.block.get("checkpoint")
         self.checkpoint = cp if isinstance(cp, dict) else {}
@@ -4337,7 +4642,8 @@ class QueueRun(object):
     # ---------------------------------------------------------------- the line of a queue
     async def run(self):
         log.info(kv("queue_taken", run_id=self.run_id, partition_id=self.partition_id, attempt=self.attempt, resumed=self.resumed,
-                    source_type=self.source_type, full=self.full, classify=self.write))
+                    source_type=self.source_type, full=self.full, classify=self.write,
+                    classifications=_classifications_seen(self.block)))
         self.w.set_work("working", stage=self.stage, run_id=self.run_id)
         renew_task = asyncio.ensure_future(self.renew_loop())
         try:
