@@ -8,7 +8,7 @@
 # build), architect directive 2026-48-09 (what scan hands the database), ds_connect_lib 2026.47.4.
 #
 # Layout of this file
-#    1  versions, settings, logging, catalogues of reasons and health codes
+#    1  versions, settings, logging, catalogs of reasons and health codes
 #    2  text rules
 #    3  limits, the temporary-disk budget, spooling and hashing, the source of an object
 #    4  what a file is: sniffing from the bytes
@@ -19,6 +19,10 @@
 #    9  the worker: check-in, heartbeat, claiming, the queue, renewals, hand-ins, stopping
 #   10  the endpoints and serve()
 #
+#__version__ = '2026.48.4'    # the worker's report as a document, sent at check-in (v_report) and again when it changes; reads
+#                              with why, loaded readers (standard 2026-48-37); a known container with parts_unread opened again
+#                              in a run with classify (note 2026-48-39); document properties in meta.doc, meta.labels and
+#                              meta.custom; customer files opened with O_NOATIME (note 2026-48-45); US spelling (note 2026-48-44)
 #__version__ = '2026.48.3'    # against db 2026-48-02 as built (note 2026-48-17): the {held, known} lookup, became_skipped_parts,
 #                              10,000 objects and 50,000 parts a call, part and meta limits; folders checked again until usable
 #                              (note 2026-48-22); the shared health sentences (note 2026-48-23); deploy/ds_scan_worker.example.yml
@@ -58,12 +62,13 @@ from functools import lru_cache
 import ds_connect_lib
 
 # ===========================================================================
-# 1. VERSIONS, SETTINGS, LOGGING, CATALOGUES
+# 1. VERSIONS, SETTINGS, LOGGING, CATALOGS
 # ===========================================================================
-VERSION = "2026.48.3"
+VERSION = "2026.48.4"
 WORKER_TYPE = "scan"
 STAGE = "scan"
-STANDARD = "worker-core-standard 2026-48-11"
+STANDARD = "worker-core-standard 2026-48-37"
+STANDARD_EDITION = "2026-48-37"
 
 # what this worker can read, by data source type; the capabilities are these, less any whose driver
 # the image lacks (ds_connect_lib.types()) or, for directory, when no file roots are set
@@ -96,7 +101,8 @@ _MB = 1024 * 1024
 
 # the functions this worker calls, with the parameters it sends; optional ones are used when present
 CONTRACT = {
-    "sys_post_worker_checkin": ("v_worker_type", "v_worker_name", "v_worker_version", "v_address", "v_port", "v_capabilities"),
+    "sys_post_worker_checkin": ("v_worker_type", "v_worker_name", "v_worker_version", "v_address", "v_port", "v_capabilities", "v_report"),
+    "sys_post_worker_report": ("v_worker_id", "v_report"),
     "sys_post_worker_heartbeat": ("v_worker_id", "v_status", "v_health"),
     "sys_get_partitions_held": ("v_worker_id",),
     "sys_post_partition_claim_next": ("v_worker_id",),
@@ -109,7 +115,9 @@ CONTRACT = {
     "sys_post_scan_batch": ("v_run_id", "v_partition_id", "v_worker_id", "v_attempt", "v_objects"),
     "sys_get_known_content": ("v_run_id", "v_partition_id", "v_worker_id", "v_attempt", "v_sha256"),
 }
-CONTRACT_OPTIONAL = ("sys_get_known_content",)
+CONTRACT_OPTIONAL = ("sys_get_known_content", "sys_post_worker_report")
+# parameters looked for at the contract check and sent only when the function takes them (standard 2026-48-37 §5, §6)
+CONTRACT_OPTIONAL_PARAMS = {"sys_post_worker_checkin": ("v_report",)}
 
 # the SQL type of every parameter sent, so each call is unambiguous
 PARAM_TYPES = {
@@ -117,7 +125,7 @@ PARAM_TYPES = {
     "v_capabilities": "jsonb", "v_worker_id": "bigint", "v_status": "text", "v_health": "jsonb", "v_run_id": "bigint",
     "v_stage": "text", "v_partition_id": "integer", "v_attempt": "integer", "v_progress": "jsonb", "v_checkpoint": "jsonb",
     "v_summary": "jsonb", "v_outcome": "text", "v_code": "text", "v_params": "jsonb", "v_text": "text", "v_after": "bigint",
-    "v_limit": "integer", "v_data_source_id": "bigint", "v_objects": "jsonb", "v_sha256": "text[]",
+    "v_limit": "integer", "v_data_source_id": "bigint", "v_objects": "jsonb", "v_sha256": "text[]", "v_report": "jsonb",
 }
 
 
@@ -312,6 +320,7 @@ def file_state(path):
 #   The default is what is shown when the variable isn't set: a text, a function of the environment, or None.
 # ---------------------------------------------------------------------------
 SECRET_FILES = ("repository_host", "repository_port", "repository_name", "repository_username", "sentinel_worker_password")
+REQUIRED_SETTINGS = ("DS_SERVICE",)
 SETTINGS_SPEC = (
     ("DS_SERVICE", "value", None),
     ("DS_SERVICE_PORT", "value", "5540"),
@@ -346,21 +355,16 @@ SETTINGS_SPEC = (
 )
 
 
-def startup_report(title, settings_spec, secret_files, check, env=None):
-    """Writes, before the settings are checked, what the container was given: who the process runs as,
-    every setting (connection values as set or not set only), the secrets folder, each secret file and
-    the password file (found, not found, or found but unreadable: never their content or length), each
-    folder the worker needs, and DS_ variables the worker doesn't know. Then runs check(): settings_ok,
-    or settings_invalid with the variable, the problem and the path looked at. One line per item, in the
-    log's format, to stdout and to <DS_LOG_DIR>/<DS_SERVICE>.log when that folder can be used.
-    Returns check()'s result, or None when the settings can't be used (the caller exits 2).
-    Standard names it relies on: DS_SERVICE, DS_LOG_DIR, DS_SECRETS_DIR, DS_DB_PASSWORD_FILE."""
+def worker_report(title, settings_spec, secret_files, env=None, required=(), reads=None, loaded=None, standard=None, mode=None):
+    """The worker's report (standard 2026-48-37 §18): what the container was given and what the worker can do,
+    as (document, lines). The document is what the check-in's v_report carries; the lines are the log's, from
+    the same facts, so the two never disagree. Nothing in it is a password, a key, a connection value or
+    anything read from a customer's data. Standard names it relies on: DS_SERVICE, DS_LOG_DIR,
+    DS_SECRETS_DIR, DS_DB_PASSWORD_FILE. reads and loaded are the worker's own lists, given as data."""
     import json as _json
-    import logging as _logging
     import os as _os
-    import re as _re
+    import platform as _platform
     import stat as _stat
-    import sys as _sys
 
     env = _os.environ if env is None else env
 
@@ -372,8 +376,8 @@ def startup_report(title, settings_spec, secret_files, check, env=None):
             return _json.dumps(text, ensure_ascii=False)
         return text
 
-    def line(event, **fields):
-        return event + "".join(" %s=%s" % (k, q(v)) for k, v in fields.items())
+    def line(level, event, **fields):
+        lines.append((level, event + "".join(" %s=%s" % (k, q(v)) for k, v in fields.items())))
 
     def state_of(path):
         try:
@@ -391,7 +395,7 @@ def startup_report(title, settings_spec, secret_files, check, env=None):
             return "found_unreadable"
         return "found"
 
-    def folder(path, mode):
+    def folder(path, mode_):
         try:
             st = _os.stat(path)
         except PermissionError:
@@ -400,10 +404,7 @@ def startup_report(title, settings_spec, secret_files, check, env=None):
             return "no", "no"
         if not _stat.S_ISDIR(st.st_mode):
             return "not_a_folder", "no"
-        if mode == "write":
-            ok = _os.access(path, _os.W_OK | _os.X_OK)
-        else:
-            ok = _os.access(path, _os.R_OK | _os.X_OK)
+        ok = _os.access(path, (_os.W_OK | _os.X_OK) if mode_ == "write" else (_os.R_OK | _os.X_OK))
         return "yes", "yes" if ok else "no"
 
     def raw(name, aliases=()):
@@ -413,7 +414,118 @@ def startup_report(title, settings_spec, secret_files, check, env=None):
                 return str(v).strip()
         return None
 
-    # where the lines go: stdout, and the log file when the folder can be used
+    doc_state = {"found": "found", "not_found": "not_found", "found_unreadable": "unreadable", "cannot_tell": "unreadable"}
+    machine = _platform.machine().lower()
+    lines = []
+    doc = {"standard": standard, "build": {"worker": title.get("version"), "connect": title.get("connect"), "python": title.get("python"),
+                                           "platform": "linux/" + {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine),
+                                           "uid": _os.getuid(), "gid": _os.getgid()},
+           "mode": mode, "settings": [], "secrets": [], "folders": [], "reads": list(reads or []), "loaded": list(loaded or []),
+           "unknown_settings": []}
+    line("INFO", "startup_report", **title)
+    # 1. who it runs as
+    line("INFO", "startup_user", uid=_os.getuid(), gid=_os.getgid())
+    # 2. every setting the worker knows, in a fixed order
+    folders = []
+    known = set()
+    for item in settings_spec:
+        name, kind, default = item[0], item[1], item[2]
+        aliases = tuple(item[3]) if len(item) > 3 else ()
+        known.add(name)
+        known.update(a for a in aliases if a.startswith("DS_"))
+        value = raw(name, aliases)
+        is_set = value is not None
+        if not is_set:
+            default = default(env) if callable(default) else default
+        source = "set" if is_set else ("missing" if name in required else "default")
+        if kind == "connection":
+            doc["settings"].append({"name": name, "value": None, "from": source, "hidden": True})
+            if is_set:
+                line("INFO", "startup_setting", name=name, state="set")
+            elif default is None:
+                line("INFO", "startup_setting", name=name, state="not_set")
+            else:
+                line("INFO", "startup_setting", name=name, state="not_set", default=default)
+            continue
+        shown = value if is_set else (default if default is not None else "none")
+        doc["settings"].append({"name": name, "value": value if is_set else default, "from": source})
+        line("INFO", "startup_setting", name=name, state="set" if is_set else "not_set", value=shown)
+        if kind == "dir_write":
+            folders.append((name, value or default, "write"))
+        elif kind == "dirs_read" and (value or default):
+            for path in [x.strip() for x in str(value or default).split(":") if x.strip()]:
+                folders.append((name, path, "read"))
+    # 3. the secrets folder
+    secrets_dir = (raw("DS_SECRETS_DIR") or "/run/secrets").rstrip("/") or "/"
+    exists, _w = folder(secrets_dir, "read")
+    can_look = "no"
+    if exists == "yes":
+        try:
+            _os.listdir(secrets_dir)
+            can_look = "yes"
+        except OSError:
+            can_look = "no"
+    doc["secrets_folder"] = {"path": secrets_dir, "exists": exists == "yes", "can_look_in": can_look == "yes"}
+    line("INFO", "startup_secrets_folder", path=secrets_dir, exists=exists, can_look_in=can_look)
+    # 4. each secret file the worker looks for: the state only
+    for name in secret_files:
+        st = state_of(_os.path.join(secrets_dir, name))
+        doc["secrets"].append({"name": name, "state": doc_state[st]})
+        line("INFO" if st == "found" else "WARNING", "startup_secret_file", name=name, state=st)
+    # 5. the password file in use
+    pw = raw("DS_DB_PASSWORD_FILE") or (secrets_dir.rstrip("/") + "/sentinel_worker_password")
+    st = state_of(pw)
+    doc["password_file"] = {"path": pw, "state": doc_state[st]}
+    line("INFO" if st == "found" else "WARNING", "startup_password_file", path=pw, state=st)
+    # 6. each folder it needs
+    for name, path, mode_ in folders:
+        exists, ok = folder(path, mode_)
+        doc["folders"].append({"setting": name, "path": path, "needs": mode_, "exists": exists == "yes", "usable": exists == "yes" and ok == "yes"})
+        fields = {"setting": name, "path": path, "exists": exists}
+        fields["writable" if mode_ == "write" else "readable"] = ok
+        line("INFO" if (exists == "yes" and ok == "yes") else "WARNING", "startup_folder", **fields)
+    # what it can read, and what it loaded (the worker's own lists)
+    for r in doc["reads"]:
+        fields = {"type": r.get("type"), "offered": "yes" if r.get("offered") else "no"}
+        if r.get("why"):
+            fields["why"] = r["why"]
+        line("INFO" if r.get("offered") else "WARNING", "startup_reads", **fields)
+    for item in doc["loaded"]:
+        fields = {"kind": item.get("kind"), "name": item.get("name")}
+        if item.get("version"):
+            fields["version"] = item["version"]
+        fields["ok"] = "yes" if item.get("ok") else "no"
+        if item.get("why"):
+            fields["why"] = item["why"]
+        line("INFO", "startup_loaded", **fields)
+    # 7. DS_ variables this worker doesn't know: names only
+    for name in sorted(k for k in env if k.startswith("DS_") and k not in known):
+        doc["unknown_settings"].append(name)
+        line("WARNING", "startup_unknown_variable", name=name)
+    return doc, lines
+
+
+def startup_report(title, settings_spec, secret_files, check, env=None, required=(), reads_fn=None, loaded_fn=None, standard=None):
+    """Writes the worker's report before the settings are checked, then runs check(): settings_ok, or
+    settings_invalid with the variable, the problem and the path looked at. One line per item, in the log's
+    format, to stdout and to <DS_LOG_DIR>/<DS_SERVICE>.log when that folder can be used. Returns check()'s
+    result, or None when the settings can't be used (the caller exits 2)."""
+    import logging as _logging
+    import os as _os
+    import re as _re
+    import sys as _sys
+
+    env = _os.environ if env is None else env
+    try:
+        reads = reads_fn(env) if reads_fn else None
+    except Exception:
+        reads = None
+    try:
+        loaded = loaded_fn() if loaded_fn else None
+    except Exception:
+        loaded = None
+    _doc, lines = worker_report(title, settings_spec, secret_files, env=env, required=required, reads=reads, loaded=loaded, standard=standard)
+
     logger = _logging.getLogger("startup_report")
     logger.propagate = False
     logger.setLevel(_logging.INFO)
@@ -421,10 +533,10 @@ def startup_report(title, settings_spec, secret_files, check, env=None):
         logger.removeHandler(h)
     fmt = _logging.Formatter("%(asctime)s|%(levelname)s|%(message)s")
     handlers = [_logging.StreamHandler(_sys.stdout)]
-    service = raw("DS_SERVICE") or ""
-    log_dir = raw("DS_LOG_DIR") or "/mnt/logs"
+    service = (env.get("DS_SERVICE") or "").strip()
+    log_dir = (env.get("DS_LOG_DIR") or "").strip() or "/mnt/logs"
     log_file = None
-    if _re.match(r"^[A-Za-z0-9_.-]{1,60}$", service) and folder(log_dir, "write") == ("yes", "yes"):
+    if _re.match(r"^[A-Za-z0-9_.-]{1,60}$", service) and _os.path.isdir(log_dir) and _os.access(log_dir, _os.W_OK | _os.X_OK):
         try:
             log_file = _logging.FileHandler(_os.path.join(log_dir, service + ".log"), mode="a", encoding="utf-8")
             handlers.append(log_file)
@@ -433,74 +545,18 @@ def startup_report(title, settings_spec, secret_files, check, env=None):
     for h in handlers:
         h.setFormatter(fmt)
         logger.addHandler(h)
-
+    levels = {"INFO": _logging.INFO, "WARNING": _logging.WARNING, "ERROR": _logging.ERROR}
     try:
-        logger.info(line("startup_report", **title))
-        # 1. who it runs as
-        logger.info(line("startup_user", uid=_os.getuid(), gid=_os.getgid()))
-        # 2. every setting the worker knows, in a fixed order
-        folders = []
-        known = set()
-        for item in settings_spec:
-            name, kind, default = item[0], item[1], item[2]
-            aliases = tuple(item[3]) if len(item) > 3 else ()
-            known.add(name)
-            known.update(a for a in aliases if a.startswith("DS_"))
-            value = raw(name, aliases)
-            is_set = value is not None
-            if not is_set:
-                default = default(env) if callable(default) else default
-            if kind == "connection":
-                if is_set:
-                    logger.info(line("startup_setting", name=name, state="set"))
-                elif default is None:
-                    logger.info(line("startup_setting", name=name, state="not_set"))
-                else:
-                    logger.info(line("startup_setting", name=name, state="not_set", default=default))
-                continue
-            shown = value if is_set else (default if default is not None else "none")
-            logger.info(line("startup_setting", name=name, state="set" if is_set else "not_set", value=shown))
-            if kind == "dir_write":
-                folders.append((name, value or default, "write"))
-            elif kind == "dirs_read" and (value or default):
-                for p in [x.strip() for x in str(value or default).split(":") if x.strip()]:
-                    folders.append((name, p, "read"))
-        # 3. the secrets folder
-        secrets_dir = (raw("DS_SECRETS_DIR") or "/run/secrets").rstrip("/") or "/"
-        exists, _w = folder(secrets_dir, "read")
-        can_look = "no"
-        if exists == "yes":
-            try:
-                _os.listdir(secrets_dir)
-                can_look = "yes"
-            except OSError:
-                can_look = "no"
-        logger.info(line("startup_secrets_folder", path=secrets_dir, exists=exists, can_look_in=can_look))
-        # 4. each secret file the worker looks for: the state only
-        for name in secret_files:
-            st = state_of(_os.path.join(secrets_dir, name))
-            (logger.info if st == "found" else logger.warning)(line("startup_secret_file", name=name, state=st))
-        # 5. the password file in use
-        pw = raw("DS_DB_PASSWORD_FILE") or (secrets_dir.rstrip("/") + "/sentinel_worker_password")
-        st = state_of(pw)
-        (logger.info if st == "found" else logger.warning)(line("startup_password_file", path=pw, state=st))
-        # 6. each folder it needs
-        for name, path, mode in folders:
-            exists, ok = folder(path, mode)
-            fields = {"setting": name, "path": path, "exists": exists}
-            fields["writable" if mode == "write" else "readable"] = ok
-            (logger.info if (exists == "yes" and ok == "yes") else logger.warning)(line("startup_folder", **fields))
-        # 7. DS_ variables this worker doesn't know: names only
-        for name in sorted(k for k in env if k.startswith("DS_") and k not in known):
-            logger.warning(line("startup_unknown_variable", name=name))
-        # the result
+        for level, message in lines:
+            logger.log(levels[level], message)
         try:
             result = check()
         except Exception as e:
             fields = {"variable": getattr(e, "variable", "-"), "problem": str(getattr(e, "problem", type(e).__name__)).replace(" ", "_")}
+            text = "settings_invalid" + "".join(" %s=%s" % (k, v) for k, v in fields.items())
             if getattr(e, "path", None):
-                fields["path"] = e.path
-            logger.error(line("settings_invalid", **fields))
+                text += " path=" + (e.path if (e.path and " " not in e.path and "|" not in e.path) else '"%s"' % e.path)
+            logger.error(text)
             return None
         logger.info("settings_ok")
         return result
@@ -702,7 +758,7 @@ class Refused(Exception):
 # ===========================================================================
 # 2. TEXT RULES (from V1 2025.41.2-.4, unchanged in spirit)
 #   A character is never silently deleted: what is removed becomes a space. Real characters are kept.
-#   Content is NFC-normalised; identifiers are not.
+#   Content is NFC-normalized; identifiers are not.
 # ===========================================================================
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _PG_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
@@ -808,8 +864,8 @@ def _meta_bytes(meta):
 
 
 def cap_meta(meta):
-    """meta held under 16 KB: long strings cut, then long lists cut, then the largest keys dropped; whenever
-    anything was cut, meta_cut is true."""
+    """meta held under META_TARGET (note 2026-48-45): the custom properties go first, then long values, and
+    the short fields of doc and labels last. Whenever anything was cut, meta_cut is true."""
     meta = json_safe(meta or {})
     if _meta_bytes(meta) <= META_TARGET:
         return meta
@@ -823,17 +879,31 @@ def cap_meta(meta):
             return {k: cut(x, n) for k, x in v.items()}
         return v
 
+    meta["meta_cut"] = True
+    meta.pop("custom", None)
+    if _meta_bytes(meta) <= META_TARGET:
+        return meta
+    protected = ("doc", "labels", "meta_cut")
     for n in (1000, 200, 60):
-        meta = cut(meta, n)
-        meta["meta_cut"] = True
+        for k in list(meta):
+            if k not in protected:
+                meta[k] = cut(meta[k], n)
         if _meta_bytes(meta) <= META_TARGET:
             return meta
-    keys = sorted((k for k in meta if k != "meta_cut"), key=lambda k: len(json.dumps(meta[k], ensure_ascii=False)), reverse=True)
-    for k in keys:
+    others = sorted((k for k in meta if k not in protected), key=lambda k: len(json.dumps(meta[k], ensure_ascii=False)), reverse=True)
+    for k in others:
         meta.pop(k, None)
         if _meta_bytes(meta) <= META_TARGET:
-            break
-    meta["meta_cut"] = True
+            return meta
+    for n in (200, 60):
+        for k in ("doc", "labels"):
+            if k in meta:
+                meta[k] = cut(meta[k], n)
+        if _meta_bytes(meta) <= META_TARGET:
+            return meta
+    meta.pop("labels", None)
+    if _meta_bytes(meta) > META_TARGET:
+        meta.pop("doc", None)
     return meta
 
 
@@ -859,20 +929,44 @@ class Budget(object):
             self.used = max(0, self.used - n)
 
 
+O_NOATIME = getattr(os, "O_NOATIME", 0)
+NOATIME_REFUSED = [0]           # opens of a customer's file the system refused O_NOATIME for (the worker doesn't own the file)
+
+
+def open_customer_fd(path, follow=False, noatime=True):
+    """Opens a customer's file for reading without moving its access time (note 2026-48-45): O_NOATIME where
+    the system has it. The system refuses that flag to a process that doesn't own the file; then the file
+    is opened again without it. Returns (fd, noatime_held). follow=True for /proc/self/fd links."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if not follow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    if O_NOATIME and noatime:
+        try:
+            return os.open(path, flags | O_NOATIME), True
+        except PermissionError as e:
+            if getattr(e, "errno", None) != 1:      # EPERM: O_NOATIME refused. Anything else is the file's own refusal
+                raise
+            NOATIME_REFUSED[0] += 1
+    return os.open(path, flags), False
+
+
 class Source(object):
     """The bytes of one object or part, in memory, spooled to the worker's temporary folder, or read in
-    place on a mounted share. Knows its size, its SHA-256 and its first bytes."""
+    place on a mounted share. Knows its size, its SHA-256 and its first bytes. noatime is None for bytes of
+    our own (memory, spool), and for a customer's file read in place says whether O_NOATIME was allowed."""
 
-    def __init__(self, name, path=None, data=None, size=0, sha256=None, head=b"", owned=False, budget=None, budgeted=0):
+    def __init__(self, name, path=None, data=None, size=0, sha256=None, head=b"", owned=False, budget=None, budgeted=0, noatime=None):
         self.name = name or ""
         self.path = path
         self.data = data
         self.size = size
         self.sha256 = sha256
         self.head = head
+        self.noatime = noatime
         self._owned = owned         # a spool file of ours, removed by cleanup()
         self._budget = budget
         self._budgeted = budgeted
+        self._copies = []           # copies made for a library that opens files itself
 
     @property
     def ext(self):
@@ -882,16 +976,50 @@ class Source(object):
     def open(self):
         if self.data is not None:
             return io.BytesIO(self.data)
+        if self.noatime is not None:
+            fd, _held = open_customer_fd(self.path, follow=True, noatime=self.noatime)
+            return os.fdopen(fd, "rb")
         return open(self.path, "rb")
 
     def bytes(self):
         """The whole object in memory: only for objects under the memory threshold."""
         if self.data is not None:
             return self.data
-        with open(self.path, "rb") as fh:
+        with self.open() as fh:
             return fh.read()
 
+    def for_library(self, ctx):
+        """What to give a library that opens files by itself (PyMuPDF, xlrd): (path, data). A customer's file
+        held with O_NOATIME is never given by its path, because the library's own open would move its access
+        time: one under DS_SCAN_MEMORY_MB goes in memory, a larger one is copied to the temporary folder
+        first, through our own open."""
+        if self.data is not None:
+            return None, self.data
+        if not self.noatime:
+            return self.path, None
+        if self.size <= ctx.settings.memory_mb * _MB:
+            return None, self.bytes()
+        self._budget = self._budget or ctx.budget
+        self._budget.take(self.size)
+        self._budgeted += self.size
+        out, path = ctx.new_spool_file()
+        self._copies.append(path)
+        with out, self.open() as fh:
+            while True:
+                ctx.check()
+                chunk = fh.read(CHUNK)
+                if not chunk:
+                    break
+                out.write(chunk)
+        return path, None
+
     def cleanup(self):
+        for path in self._copies:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._copies = []
         if self._owned and self.path:
             try:
                 os.remove(self.path)
@@ -1114,7 +1242,7 @@ def _ole_type(src):
         if src.data is not None:
             mem = src.data
         else:
-            fh = open(src.path, "rb")
+            fh = src.open()
             mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
             mem = mm
         cd = compdoc.CompDoc(mem, logfile=io.StringIO(), ignore_workbook_corruption=True)
@@ -1982,7 +2110,11 @@ def read_xlsx(src, ctx, ti):
             entry = sheet_part(ctx, sh["name"], i + 1, lambda mk=make_rows: _prescan(mk, ctx),
                                lambda ref, w, mk=make_rows, nm=sh["name"]: emit_rowshape(mk, nm, ctx, ref, w))
             sheet_list.append(entry)
-        return _workbook_result(ctx, sheet_list)
+        try:
+            props = office_properties(zf)
+        except Exception:
+            props = {}
+        return _workbook_result(ctx, sheet_list, props)
 
 
 # ---------------------------------------------------------------------------
@@ -2022,10 +2154,11 @@ def _xls_typed_rows(sheet, datemode):
 def read_xls(src, ctx, ti):
     import xlrd
     try:
-        if src.path is not None:
-            book = xlrd.open_workbook(src.path, on_demand=True, logfile=io.StringIO(), ignore_workbook_corruption=True)
+        path, data = src.for_library(ctx)
+        if path is not None:
+            book = xlrd.open_workbook(path, on_demand=True, logfile=io.StringIO(), ignore_workbook_corruption=True)
         else:
-            book = xlrd.open_workbook(file_contents=src.data, on_demand=True, logfile=io.StringIO(), ignore_workbook_corruption=True)
+            book = xlrd.open_workbook(file_contents=data, on_demand=True, logfile=io.StringIO(), ignore_workbook_corruption=True)
     except xlrd.biffh.XLRDError as e:
         if "encrypt" in str(e).lower():
             raise ScanFail("object_encrypted")
@@ -2366,7 +2499,9 @@ class PdfDocument(object):
     .meta (document properties and the page count), .pages() yields (page number from 1, text with its
     line feeds), .close(). An encrypted PDF raises ScanFail(object_encrypted)."""
 
-    def __init__(self, src):
+    LIBRARY = ("PyMuPDF", "pymupdf")     # the distribution and the module, named in the worker's report
+
+    def __init__(self, src, ctx):
         import pymupdf
         try:
             pymupdf.TOOLS.mupdf_display_errors(False)
@@ -2374,23 +2509,21 @@ class PdfDocument(object):
         except Exception:
             pass
         try:
-            if src.path is not None:
-                self._doc = pymupdf.open(src.path, filetype="pdf")
+            path, data = src.for_library(ctx)
+            if path is not None:
+                self._doc = pymupdf.open(path, filetype="pdf")
             else:
-                self._doc = pymupdf.open(stream=src.data, filetype="pdf")
+                self._doc = pymupdf.open(stream=data, filetype="pdf")
         except Exception:
             raise ScanFail("object_unreadable", reason="not a readable PDF")
         if self._doc.needs_pass:
             self.close()
             raise ScanFail("object_encrypted")
-        md = {}
+        md = {"pages": self._doc.page_count}
         try:
-            for k, v in (self._doc.metadata or {}).items():
-                if v and k not in ("format", "encryption"):
-                    md[k] = v
+            md.update(pdf_properties(self._doc.metadata))
         except Exception:
             pass
-        md["pages"] = self._doc.page_count
         self.meta = md
 
     def pages(self):
@@ -2405,7 +2538,7 @@ class PdfDocument(object):
 
 
 def read_pdf(src, ctx, ti):
-    doc = PdfDocument(src)
+    doc = PdfDocument(src, ctx)
     try:
         if not ctx.scope.write:
             return no_classify_result(meta=doc.meta)
@@ -2468,19 +2601,171 @@ def _iter_paragraphs(zf, name, p_tag, t_tag, space_tags, hyphen_tag, lf_tags, ct
             el.clear()
 
 
-def _core_props(zf):
-    props = {}
+# ---------------------------------------------------------------------------
+# 6.9a document properties (architect note 2026-48-45): one vocabulary in meta.doc, sensitivity labels in
+#      meta.labels, every other custom property in meta.custom. Customer text: never logged, never in a reason.
+# ---------------------------------------------------------------------------
+_CORE_NAMES = {"title": "title", "subject": "subject", "keywords": "keywords", "creator": "author", "lastModifiedBy": "last_modified_by",
+               "created": "created", "modified": "modified", "lastPrinted": "last_printed", "revision": "revision",
+               "category": "category", "language": "language", "description": "comments", "contentStatus": "status"}
+_APP_TEXT = {"Company": "company", "Manager": "manager", "Template": "template", "Application": "application", "AppVersion": "app_version"}
+_APP_COUNTS = {"Pages": "pages", "Words": "words", "Characters": "characters", "Paragraphs": "paragraphs", "Lines": "lines",
+               "Slides": "slides", "Notes": "notes", "HiddenSlides": "hidden_slides", "TotalTime": "editing_minutes"}
+_DATE_NAMES = {"created", "modified", "last_printed"}
+_LABEL_RE = re.compile(r"^MSIP_Label_([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})_([A-Za-z]+)$")
+_LABEL_FIELDS = {"Name": "name", "Enabled": "enabled", "SetDate": "set_at", "Method": "method", "SiteId": "site_id"}
+_PDF_DATE_RE = re.compile(r"^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?(?:([Zz])|([+-])(\d{2})'?(\d{2})?'?)?")
+CUSTOM_MAX = 50
+CUSTOM_VALUE_MAX = 200
+PROP_VALUE_MAX = 1000
+
+
+def iso_date(text):
+    """A date as ISO 8601, with its offset when the file gives one; text that isn't a date stays as it is."""
+    t = (text or "").strip()
+    m = _PDF_DATE_RE.match(t)
+    if m:
+        y, mo, d, h, mi, s, z, sign, oh, om = m.groups()
+        out = "%s-%s-%sT%s:%s:%s" % (y, mo or "01", d or "01", h or "00", mi or "00", s or "00")
+        if z:
+            return out + "+00:00"
+        if sign:
+            return out + "%s%s:%s" % (sign, oh, om or "00")
+        return out
     try:
-        from lxml import etree
-        data = zf.read("docProps/core.xml")
-        root = etree.fromstring(data, parser=etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False))
-        for item in root.iter():
-            tag = _xl_local(item.tag)
-            if tag != "coreProperties" and item.text and item.text.strip():
-                props[tag] = item.text.strip()
+        return dt.datetime.fromisoformat(t.replace("Z", "+00:00")).isoformat()
+    except ValueError:
+        return t
+
+
+def _prop_text(v, limit=PROP_VALUE_MAX):
+    return pg_safe_str(str(v)).strip()[:limit]
+
+
+def _xml_root(zf, name):
+    from lxml import etree
+    try:
+        info = zf.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > 8 * _MB:
+        return None
+    try:
+        return etree.fromstring(zf.read(info), parser=etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False))
     except Exception:
-        pass
-    return props
+        return None
+
+
+def _props_parts(zf):
+    """Where the package keeps its three property parts: by its relationships, else the usual names."""
+    found = {"core": "docProps/core.xml", "app": "docProps/app.xml", "custom": "docProps/custom.xml"}
+    root = _xml_root(zf, "_rels/.rels")
+    if root is not None:
+        for rel in root:
+            rtype = rel.get("Type") or ""
+            target = (rel.get("Target") or "").lstrip("/")
+            for key, tail in (("core", "/core-properties"), ("app", "/extended-properties"), ("custom", "/custom-properties")):
+                if rtype.endswith(tail) and target:
+                    found[key] = target
+    return found
+
+
+def _custom_value(prop):
+    for child in prop:
+        kind = _xl_local(child.tag)
+        text = child.text or ""
+        if kind == "bool":
+            return text.strip().lower() in ("true", "1")
+        if kind in ("i1", "i2", "i4", "i8", "int", "ui1", "ui2", "ui4", "ui8", "uint"):
+            try:
+                return int(text)
+            except ValueError:
+                return _prop_text(text, CUSTOM_VALUE_MAX)
+        if kind in ("r4", "r8", "decimal"):
+            try:
+                return float(text)
+            except ValueError:
+                return _prop_text(text, CUSTOM_VALUE_MAX)
+        if kind in ("filetime", "date"):
+            return iso_date(text)
+        return _prop_text(text, CUSTOM_VALUE_MAX)
+    return None
+
+
+def office_properties(zf):
+    """meta.doc, meta.labels and meta.custom of a Word, Excel or PowerPoint package. A part that is missing or
+    can't be read is left out without failing the object; a property with no value is left out."""
+    out = {}
+    try:
+        parts = _props_parts(zf)
+    except Exception:
+        return out
+    doc = {}
+    core = _xml_root(zf, parts["core"])
+    if core is not None:
+        for item in core:
+            name = _CORE_NAMES.get(_xl_local(item.tag))
+            text = (item.text or "").strip() if isinstance(item.tag, str) else ""
+            if name and text:
+                doc[name] = iso_date(text) if name in _DATE_NAMES else _prop_text(text)
+    app = _xml_root(zf, parts["app"])
+    if app is not None:
+        for item in app:
+            tag = _xl_local(item.tag) if isinstance(item.tag, str) else ""
+            text = (item.text or "").strip()
+            if not text:
+                continue
+            if tag in _APP_TEXT:
+                doc[_APP_TEXT[tag]] = _prop_text(text)
+            elif tag in _APP_COUNTS:
+                try:
+                    doc[_APP_COUNTS[tag]] = int(text)
+                except ValueError:
+                    pass
+    if doc:
+        out["doc"] = doc
+    custom_root = _xml_root(zf, parts["custom"])
+    if custom_root is not None:
+        labels = collections.OrderedDict()
+        custom = {}
+        for prop in custom_root:
+            name = (prop.get("name") or "").strip()
+            if not name:
+                continue
+            value = _custom_value(prop)
+            m = _LABEL_RE.match(name)
+            if m:
+                field = _LABEL_FIELDS.get(m.group(2))
+                label = labels.setdefault(m.group(1).lower(), {"id": m.group(1).lower()})
+                if field == "enabled":
+                    label["enabled"] = value if isinstance(value, bool) else str(value).strip().lower() == "true"
+                elif field == "set_at":
+                    label["set_at"] = iso_date(str(value))
+                elif field and value not in (None, ""):
+                    label[field] = _prop_text(value, CUSTOM_VALUE_MAX)
+                continue
+            if value in (None, "") or len(custom) >= CUSTOM_MAX:
+                continue
+            custom[_prop_text(name, CUSTOM_VALUE_MAX)] = value
+        if labels:
+            out["labels"] = [dict(id=lb["id"], name=lb.get("name"), enabled=lb.get("enabled"), set_at=lb.get("set_at"),
+                                  method=lb.get("method"), site_id=lb.get("site_id")) for lb in labels.values()]
+        if custom:
+            out["custom"] = custom
+    return out
+
+
+_PDF_NAMES = {"title": "title", "subject": "subject", "keywords": "keywords", "author": "author", "creationDate": "created",
+              "modDate": "modified", "creator": "application", "producer": "producer"}
+
+
+def pdf_properties(info):
+    doc = {}
+    for key, name in _PDF_NAMES.items():
+        v = (info or {}).get(key)
+        if v and str(v).strip():
+            doc[name] = iso_date(str(v)) if name in _DATE_NAMES else _prop_text(v)
+    return {"doc": doc} if doc else {}
 
 
 def _embedded_entries(zf):
@@ -2515,7 +2800,7 @@ def read_docx(src, ctx, ti):
     with src.open() as fh:
         zf = zipfile.ZipFile(fh)
         names = zf.namelist()
-        meta = _core_props(zf)
+        meta = office_properties(zf)
         headers = sorted(n for n in names if re.match(r"^word/header\d*\.xml$", n))
         footers = sorted(n for n in names if re.match(r"^word/footer\d*\.xml$", n))
         sink = ctx.sink(_sink_ref(ctx), "text", "text") if ctx.scope.write else None
@@ -2579,7 +2864,7 @@ def read_pptx(src, ctx, ti):
     with src.open() as fh:
         zf = zipfile.ZipFile(fh)
         names = zf.namelist()
-        meta = _core_props(zf)
+        meta = office_properties(zf)
         display, notes_to_slide = _pptx_slide_maps(zf)
         slides = {}
         for name in names:
@@ -2710,15 +2995,18 @@ def failed_from(exc):
 
 def skip_known(known, ti, write):
     """Ruling 7: skip what was extracted, and what wasn't when this build still can't read that type.
-    A known container: its parts come from the database (ruling 6). Known without a classify stage:
-    read again only when this run has one."""
+    A known container: its parts come from the database (ruling 6), unless parts_unread says some of them
+    wait for a classify stage this run has (DB-82 §6). Known without a classify stage: read again only when
+    this run has one."""
     if not known:
         return False
     if known.get("extracted"):
         return True
     why = known.get("why")
     if why == "container":
-        return True
+        # note 2026-48-39: a known container with a part held as no_classify_stage is opened again in a run with
+        # classify, so those parts reach it; its other parts are then skipped parts. Otherwise it is skipped.
+        return not (write and known.get("parts_unread") is True)
     if why == "no_classify_stage":
         return not write
     return ti.reader is None
@@ -2887,7 +3175,7 @@ def scan_file_object(obj, scope, root_real):
             if not (real.startswith(root_b + b"/") or (root_b == b"/" and real != b"/")):
                 raise ScanFail("path_outside_root")
             try:
-                fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+                fd, noatime = open_customer_fd(real)
             except FileNotFoundError:
                 raise ScanFail("object_gone")
             except NotADirectoryError:
@@ -2913,7 +3201,7 @@ def scan_file_object(obj, scope, root_real):
             if n != st.st_size or not _same_file(st, os.fstat(fd)):
                 raise ScanFail("object_changed")
             name = str(obj.get("name") or "") or os.fsdecode(os.path.basename(rel))
-            src = Source(name, path=_fd_path(fd, real), size=n, sha256=sha, head=head)
+            src = Source(name, path=_fd_path(fd, real), size=n, sha256=sha, head=head, noatime=noatime)
             fields = read_source(src, ctx)
             if not _same_file(st, os.fstat(fd)):
                 raise ScanFail("object_changed")
@@ -3032,7 +3320,7 @@ class TableConnections(object):
             h.close()
 
     def cancel_all(self):
-        """A stop: the statements running now are cancelled, so a slow fetch can't hold the stop limit."""
+        """A stop: the statements running now are canceled, so a slow fetch can't hold the stop limit."""
         with self.lock:
             conns = list(self.active)
         for c in conns:
@@ -3295,7 +3583,8 @@ class Db(object):
             raise ValueError("not in the contract")
         if self.pool is None:
             raise DbAway("closed")
-        names = [k for k in params if k in CONTRACT[fn]]
+        names = [k for k in params if k in CONTRACT[fn]
+                 and (k not in CONTRACT_OPTIONAL_PARAMS.get(fn, ()) or fn + "." + k in self.optional)]
         sql_text = "select sentinel.%s(%s)" % (fn, ", ".join("%s => $%d::%s" % (k, i + 1, PARAM_TYPES[k]) for i, k in enumerate(names)))
         args = [params[k] for k in names]
         try:
@@ -3337,12 +3626,17 @@ class Db(object):
             found[r["proname"]].append((set(r["names"]), r["can"]))
         missing = []
         optional = set()
-        for fn, params in CONTRACT.items():
+        for fn, all_params in CONTRACT.items():
+            extra = CONTRACT_OPTIONAL_PARAMS.get(fn, ())
+            params = tuple(x for x in all_params if x not in extra)
             variants = found.get(fn, [])
             ok = any(set(params) <= names and can for names, can in variants)
             if ok:
                 if fn in CONTRACT_OPTIONAL:
                     optional.add(fn)
+                for x in extra:
+                    if any(set(params) | {x} <= names and can for names, can in variants):
+                        optional.add(fn + "." + x)
                 continue
             if fn in CONTRACT_OPTIONAL:
                 continue
@@ -3372,22 +3666,85 @@ def lib_version():
     return getattr(ds_connect_lib, "__version__", "?")
 
 
-def scan_capabilities(settings):
-    """Generated from code (standard §6): the types scan has a reader for, whose driver the image carries,
-    and, for directory, only with file roots set."""
+FILE_SYSTEM_TYPES = ("directory",)
+
+
+def scan_reads(file_roots):
+    """Every data source type scan's code can read, offered or not, and why not (standard 2026-48-37 §18.2).
+    The capabilities come from this too, so the two agree. why: no_file_roots (DS_FILE_ROOTS isn't set),
+    driver_missing (the library's driver for it isn't in the image), not_in_library (ds_connect_lib has no
+    such type)."""
     try:
         available = ds_connect_lib.types()
     except Exception:
         available = {}
-    types = []
+    out = []
     for t in SCAN_SOURCE_TYPES:
         info = available.get(t)
-        if info is None or not info.available:
-            continue
-        if t == "directory" and not settings.file_roots:
-            continue
-        types.append(t)
-    return {STAGE: {"types": types}}
+        if info is None:
+            why = "not_in_library"
+        elif not info.available:
+            why = "driver_missing"
+        elif t in FILE_SYSTEM_TYPES and not file_roots:
+            why = "no_file_roots"
+        else:
+            why = None
+        out.append({"type": t, "offered": why is None, "why": why})
+    return out
+
+
+def scan_reads_from_env(env):
+    return scan_reads([x for x in (env.get("DS_FILE_ROOTS") or "").split(":") if x.strip()])
+
+
+def scan_capabilities(settings):
+    """Generated from code (standard §6): the types offered in scan_reads."""
+    return {STAGE: {"types": [r["type"] for r in scan_reads(settings.file_roots) if r["offered"]]}}
+
+
+# what each format's reader is built on: (format, library's distribution name or None for Python's own, module)
+_READER_LIBRARIES = (("txt", None, None), ("csv", None, None), ("json", None, None), ("xml", "lxml", "lxml"), ("html", "lxml", "lxml"),
+                     ("pdf",) + PdfDocument.LIBRARY, ("docx", "lxml", "lxml"), ("pptx", "lxml", "lxml"), ("xlsx", "lxml", "lxml"),
+                     ("xls", "xlrd", "xlrd"), ("zip", None, None))
+
+
+def scan_loaded():
+    """What decides what scan can do (standard 2026-48-37 §18.2), each {kind, name, version, count, ok, why}.
+    Kinds: reader (one per format, with the library it is built on), writer (the working files), ocr."""
+    import importlib.metadata as _md
+    import importlib.util as _iu
+
+    def lib(dist, module):
+        if dist is None:
+            return "python " + sys.version.split()[0], True, None
+        try:
+            present = _iu.find_spec(module) is not None
+        except (ImportError, ValueError):
+            present = False
+        if not present:
+            return None, False, "not_installed"
+        try:
+            return "%s %s" % (dist.lower(), _md.version(dist)), True, None
+        except _md.PackageNotFoundError:
+            return dist.lower(), True, None
+
+    out = []
+    for name, dist, module in _READER_LIBRARIES:
+        version, ok, why = lib(dist, module)
+        out.append({"kind": "reader", "name": name, "version": version, "count": None, "ok": ok, "why": why})
+    version, ok, why = lib("pyarrow", "pyarrow")
+    out.append({"kind": "writer", "name": "parquet", "version": version, "count": None, "ok": ok, "why": why})
+    out.append({"kind": "ocr", "name": "ocr", "version": None, "count": None, "ok": False, "why": "not_in_build"})
+    return out
+
+
+def scan_report(settings=None, env=None):
+    """The report document sent at check-in and again when it changes: the same function as the log's."""
+    title = {"worker": "scan", "version": VERSION, "connect": lib_version(), "python": sys.version.split()[0]}
+    env = os.environ if env is None else env
+    doc, _lines = worker_report(title, SETTINGS_SPEC, SECRET_FILES, env=env, required=REQUIRED_SETTINGS,
+                                reads=scan_reads_from_env(env), loaded=scan_loaded(), standard=STANDARD_EDITION)
+    return doc
 
 
 def _now_iso():
@@ -3523,7 +3880,7 @@ class Worker(object):
             else:
                 problem = health_item("starting")
         detail = {"last_ask": self.last_ask, "queues_done": self.queues_done, "threads": self.s.threads,
-                  "types": self.capabilities[STAGE]["types"]}
+                  "types": self.capabilities[STAGE]["types"], "noatime_refused": NOATIME_REFUSED[0]}
         if self.queue is not None:
             detail.update(self.queue.detail())
         out = {"ready": self.ready, "problem": problem, "work": self.work, "detail": detail}
@@ -3626,6 +3983,8 @@ class Worker(object):
             if self.dir_problem is not None:
                 log.info(kv("folders_usable", work="resumes"))
                 self.wake.set()
+                self.dir_problem = None
+                await self.send_report()
             else:
                 log.info(kv("start_up_cleanup", spool=removed["spool"], tmp=removed["tmp"], runs=removed["runs"]))
             self.dir_problem = None
@@ -3692,10 +4051,11 @@ class Worker(object):
                 await self.wait_db_up()
                 ans = await self.db.call("sys_post_worker_checkin", v_worker_type=WORKER_TYPE, v_worker_name=self.s.service,
                                          v_worker_version=self.version, v_address=self.s.external_host, v_port=self.s.external_port,
-                                         v_capabilities=self.capabilities)
+                                         v_capabilities=self.capabilities, v_report=self.report())
                 self.worker_id = int(ans["worker_id"])
                 self.status = "starting"
-                log.info(kv("checked_in", worker_id=self.worker_id, types=",".join(self.capabilities[STAGE]["types"]) or "-"))
+                log.info(kv("checked_in", worker_id=self.worker_id, types=",".join(self.capabilities[STAGE]["types"]) or "-",
+                            report="sent" if "sys_post_worker_checkin.v_report" in self.db.optional else "not_taken"))
             except DbAway:
                 self.db_lost()
             except ContractBroken:
@@ -3707,6 +4067,23 @@ class Worker(object):
             except Refused as e:
                 log.error(kv("checkin_refused", hint=e.hint))
                 await asyncio.sleep(30)
+
+    def report(self):
+        try:
+            return scan_report()
+        except Exception as e:
+            log.warning(kv("report_failed", error=where(e)[0]))
+            return None
+
+    async def send_report(self):
+        """Standard 2026-48-37 §18.2: the report again when something in it changes, when the database takes it."""
+        if self.worker_id is None or "sys_post_worker_report" not in self.db.optional:
+            return
+        try:
+            await self.db.call("sys_post_worker_report", timeout=20, v_worker_id=self.worker_id, v_report=self.report())
+            log.info(kv("report_sent", worker_id=self.worker_id))
+        except (Refused, DbAway, ContractBroken) as e:
+            log.warning(kv("report_not_sent", error=type(e).__name__))
 
     async def wait_db_up(self):
         while not self.db.up:
@@ -4069,7 +4446,8 @@ class QueueRun(object):
                 continue
             if ans.get("done"):
                 self.end = "completed"
-                log.info(kv("queue_completed", run_id=self.run_id, partition_id=self.partition_id, **self.counts))
+                log.info(kv("queue_completed", run_id=self.run_id, partition_id=self.partition_id, noatime_refused=NOATIME_REFUSED[0],
+                            **self.counts))
                 break
             why = ans.get("why")
             if why == "not_held":
